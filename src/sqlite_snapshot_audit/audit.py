@@ -565,9 +565,6 @@ def not_checked(entries: list[dict]) -> list[dict]:
 def has_problems(entries: list[dict]) -> bool:
     """True if verify should exit 1 for these entries."""
     for entry in entries:
-        if entry.get("skipped") == SKIPPED_SYMLINK:
-            # nothing was read, so nothing is known: not a problem with the backup itself
-            continue
         if entry["class"] not in VERIFIABLE:
             return True
         if entry.get("integrity") != "ok":

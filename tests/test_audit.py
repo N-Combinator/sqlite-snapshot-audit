@@ -789,17 +789,18 @@ def test_symlinked_sidecar_without_a_main_file_is_an_orphan(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
-def test_skipped_symlink_does_not_change_verify_exit_code(tmp_path, capsys):
+def test_skipped_symlink_makes_verify_exit_1_like_any_not_sqlite_entry(tmp_path, capsys):
+    """A link is never opened, so nothing about its target was established: not a pass."""
     make_db(tmp_path / "a.db", rows=1)
     (tmp_path / "link.db").symlink_to(tmp_path / "a.db")
     code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
-    assert code == 0
+    assert code == 1
     assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
         ("a.db", "standalone", None),
         ("link.db", "not-sqlite", "symlink"),
     ]
     code, out, _ = run_cli(capsys, "verify", str(tmp_path))
-    assert code == 0
+    assert code == 1
     assert "not-sqlite      link.db" in out and "skipped: symlink" in out
 
     (tmp_path / "notes.db").write_text("text")
@@ -807,12 +808,31 @@ def test_skipped_symlink_does_not_change_verify_exit_code(tmp_path, capsys):
     assert code == 1
     assert len(json.loads(out)) == 3
 
+    (tmp_path / "link.db").unlink()
+    (tmp_path / "notes.db").unlink()
+    code, _, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 0  # without the link the same tree is clean
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_tree_of_only_symlinks_does_not_exit_0(tmp_path, capsys):
+    """Nothing in this tree was opened, so verify must not report it as restorable."""
+    root = tmp_path / "root"
+    root.mkdir()
+    make_db(tmp_path / "real.db", rows=1)
+    (root / "app.db").symlink_to(tmp_path / "real.db")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    assert code == 1
+    assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
+        ("app.db", "not-sqlite", "symlink"),
+    ]
+
 
 def test_dangling_symlink_is_reported_like_any_other_link(tmp_path, capsys):
     make_db(tmp_path / "a.db", rows=1)
     (tmp_path / "dangling.db").symlink_to(tmp_path / "does-not-exist")
     code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
-    assert code == 0  # a link that is not a sidecar still says nothing about a database
+    assert code == 1  # a link that is not a sidecar was never opened, so nothing is known
     assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
         ("a.db", "standalone", None),
         ("dangling.db", "not-sqlite", "symlink"),

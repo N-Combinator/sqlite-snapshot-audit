@@ -68,8 +68,9 @@ Walks the directory recursively and prints one entry per database unit or proble
     too — a `-wal` that arrived as a link to a path that does not exist on this host is the case where
     dropping it would be most expensive, since the rows it holds are in no other file;
   - every other **file symlink** gets an entry of its own with `"skipped": "symlink"`. Its `class` is
-    `not-sqlite`, because no header was read to classify it — the `skipped` key, not the class, says why. It
-    is not a problem with the backup itself and does not make `verify` exit 1.
+    `not-sqlite`, because no header was read to classify it — the `skipped` key, not the class, says why.
+    Nothing was opened, so nothing about the target is established, and `verify` exits 1 like it does for any
+    other `not-sqlite` entry.
   - a link whose target is missing says so in its `reason` (`dangling symbolic link (target is missing)`, or
     `<name> (dangling)` in the list of a unit's unfollowed sidecars).
 - A path that cannot be read — an unreadable subdirectory such as a root-only `lost+found`, or a file whose
@@ -165,7 +166,8 @@ These four are the only values of `class`. An entry may also carry `"skipped": "
 symbolic link to a file that is not a sidecar of a database, and it was not followed, so its target was
 neither read nor checked. Such an entry is classed `not-sqlite` because no SQLite header was read from it —
 `skipped` is there so that a consumer can tell "the header says this is not a database" from "the file was
-never opened". It does not affect the exit code.
+never opened". Like any other `not-sqlite` entry it makes `verify` exit 1: a tree in which nothing was opened
+is not a tree that was checked.
 
 A name ending in `-wal` or `-shm` makes a file a sidecar of the name in front of the suffix, whatever it
 contains and whether or not it can be read — that grouping happens before any header is read. When
@@ -176,8 +178,8 @@ file named exactly `-wal` or `-shm` has no main file name in front of the suffix
 
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
-| 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries (entries with `"skipped": "symlink"` are printed but do not affect the exit code) |
-| 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry (except one with `"skipped": "symlink"`), any integrity other than `ok`, or any `invalid`/`symlink-skipped`/`unreadable` `wal` (all entries are still printed) |
+| 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries |
+| 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry (including one with `"skipped": "symlink"`), any integrity other than `ok`, or any `invalid`/`symlink-skipped`/`unreadable` `wal` (all entries are still printed) |
 | 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
