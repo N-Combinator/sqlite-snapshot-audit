@@ -71,7 +71,8 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
 
     A directory that cannot be read (a root-only ``lost+found``, say) is recorded in
     ``warnings`` and skipped; the rest of the tree is still audited. Only root itself
-    being unreadable is fatal.
+    being unreadable is fatal. A symlinked directory is not descended into either, and is
+    recorded in ``warnings`` too, so an unaudited subtree is never silently passed over.
     """
 
     def on_error(err: OSError) -> None:
@@ -82,6 +83,12 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
     regular, symlinks = [], []
     for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
         dirnames.sort()
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                # os.walk is called with followlinks=False, so the subtree behind the link
+                # (which may lie outside root entirely) is not audited: say so.
+                warnings.append(f"symlinked directory not followed: {_relative(root, full)}")
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = _relative(root, full)

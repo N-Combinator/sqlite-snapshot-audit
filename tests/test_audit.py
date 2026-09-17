@@ -539,7 +539,39 @@ def test_special_files_and_symlinked_dirs_are_skipped(tmp_path):
     (root / "linked-dir").symlink_to(outside, target_is_directory=True)
     (root / "dangling.db").symlink_to(tmp_path / "does-not-exist")
     make_db(root / "real.db", rows=1)
-    assert [e["main"] for e in scan(str(root))] == ["real.db"]
+    warnings = []
+    assert [e["main"] for e in scan(str(root), warnings)] == ["real.db"]
+    assert warnings == ["symlinked directory not followed: linked-dir"]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlinked_directory_is_warned_about_not_silently_skipped(tmp_path, capsys):
+    """A linked subtree is not walked, so its databases are missing from the report."""
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "deep").mkdir(parents=True)
+    make_db(outside / "hidden.db", rows=1)
+    make_db(outside / "deep" / "deeper.db", rows=1)
+    make_db(root / "real.db", rows=1)
+    (root / "linked-dir").symlink_to(outside, target_is_directory=True)
+    (root / "sub" / "nested-link").symlink_to(outside / "deep", target_is_directory=True)
+
+    warnings = []
+    entries = scan(str(root), warnings)
+    assert [e["main"] for e in entries] == ["real.db"]
+    assert sorted(warnings) == [
+        "symlinked directory not followed: linked-dir",
+        "symlinked directory not followed: sub/nested-link",
+    ]
+
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    assert code == 0  # an unaudited subtree is not a problem with the audited one
+    assert [e["main"] for e in json.loads(out)] == ["real.db"]
+    assert err == (
+        "sqlite-snapshot-audit: warning: symlinked directory not followed: linked-dir\n"
+        "sqlite-snapshot-audit: warning: symlinked directory not followed: sub/nested-link\n"
+    )
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
