@@ -97,9 +97,23 @@ fails on the tool's side — the temporary directory is missing, full (`ENOSPC`)
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
 `verify` exits 2.
 
+Entries whose unit includes a `-wal` sidecar also gain a `wal` key. SQLite silently ignores a `-wal` file
+with a bad header — the database then passes `integrity_check` while every transaction in the `-wal` is
+lost — so `verify` reads the header of the copied `-wal` itself:
+
+| `wal`                   | meaning                                                                                    |
+|-------------------------|--------------------------------------------------------------------------------------------|
+| `"empty"`               | the `-wal` is 0 bytes (nothing to replay)                                                  |
+| `"ok (<N> frames)"`     | valid header; `N` is the number of complete frames, from the first, carrying the header's salt (frames after them are left over from an earlier WAL generation and ignored by SQLite) |
+| `"invalid: <reason>"`   | the header is truncated, has a wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), fails its checksum, declares a page size different from the database's (header bytes 16–17), or the first frame's salt differs from the header's |
+
+An `invalid` `wal` makes `verify` exit 1 even when `integrity` is `ok`. These checks catch garbage, truncated
+and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different* database with the same
+page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would replay it.
+
 A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
 of `null`. `orphan-sidecar`, `not-sqlite` and `skipped-symlink` entries are reported unchanged, without
-`integrity`/`tables`.
+`integrity`/`tables`/`wal`.
 
 ## Classes
 
@@ -118,9 +132,9 @@ a non-SQLite `name.db` has a `name.db-wal`, both a `not-sqlite` and an `orphan-s
 
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
-| 0    | tree scanned                       | every entry is `standalone`/`wal-family` with `integrity: "ok"`                            |
-| 1    | —                                  | any `orphan-sidecar`, `not-sqlite` or `skipped-symlink` entry, or any integrity other than `ok` (all entries are still printed) |
-| 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same; also when `TMPDIR` is inside `<dir>`, or when any unit is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
+| 0    | tree scanned                       | every entry is `standalone`/`wal-family` with `integrity: "ok"` and no `invalid` `wal`      |
+| 1    | —                                  | any `orphan-sidecar`, `not-sqlite` or `skipped-symlink` entry, any integrity other than `ok`, or any `invalid` `wal` (all entries are still printed) |
+| 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
 

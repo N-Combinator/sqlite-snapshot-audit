@@ -2,6 +2,7 @@ import errno
 import hashlib
 import json
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -208,6 +209,9 @@ def test_verify_reports_integrity_and_row_counts(tree, capsys):
     assert live["class"] == "wal-family"
     assert live["integrity"] == "ok"
     assert live["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL}
+    wal_size = (tree / "live" / "app.db-wal").stat().st_size
+    assert live["wal"] == f"ok ({(wal_size - 32) // (24 + 4096)} frames)"
+    assert wal_size >= 32 + 24 + 4096
 
     corrupt = entries["corrupt.sqlite3"]
     assert corrupt["class"] == "standalone"
@@ -222,6 +226,8 @@ def test_verify_reports_integrity_and_row_counts(tree, capsys):
     for main in ("notes.db", "orphans/gone.db", "orphans/shm-only.sqlite"):
         assert "integrity" not in entries[main]
         assert "tables" not in entries[main]
+        assert "wal" not in entries[main]
+    assert "wal" not in entries["standalone.db"]
 
 
 def test_scan_and_verify_do_not_modify_source_tree(tree, capsys):
@@ -432,7 +438,9 @@ def test_sidecar_next_to_non_sqlite_main_and_shm_without_wal(tmp_path):
     entries = by_main(verify(str(tmp_path)))
     assert entries["real.db"]["integrity"] == "ok"
     assert entries["real.db"]["tables"] == {"items": 2}
+    assert "wal" not in entries["real.db"]
     assert entries["walonly.db"]["tables"] == {"items": 2}
+    assert entries["walonly.db"]["wal"] == "empty"
 
 
 def test_header_detection_ignores_extension_and_sidecar_names(tmp_path):
@@ -575,6 +583,207 @@ def test_text_output_never_crashes_on_file_names(tmp_path, encoding):
         assert b"caf\\xe9.db" in result.stdout
         expected = "na\u00efve.db" if encoding == "utf-8" else "na\\xefve.db"
         assert expected.encode(encoding) in result.stdout
+
+
+def live_wal_copy(src_dir, dst_dir, name="app.db", page_size=None, rows=LIVE_ROWS_IN_WAL):
+    """Copy a live WAL-mode database (main + -wal, uncheckpointed rows) into dst_dir.
+
+    Returns (main path, -wal path) of the copy.
+    """
+    src_dir.mkdir(parents=True, exist_ok=True)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(src_dir / name)
+    try:
+        if page_size:
+            conn.execute(f"PRAGMA page_size={page_size}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("late",)] * rows)
+        conn.commit()
+        shutil.copyfile(src_dir / name, dst_dir / name)
+        shutil.copyfile(src_dir / f"{name}-wal", dst_dir / f"{name}-wal")
+    finally:
+        conn.close()
+    return dst_dir / name, dst_dir / f"{name}-wal"
+
+
+def reference_wal_checksum(data, big_endian):
+    """walChecksumBytes from SQLite's wal.c, written independently of the code under test."""
+    s1 = s2 = 0
+    order = "big" if big_endian else "little"
+    for i in range(0, len(data), 8):
+        s1 = (s1 + int.from_bytes(data[i : i + 4], order) + s2) % 2**32
+        s2 = (s2 + int.from_bytes(data[i + 4 : i + 8], order) + s1) % 2**32
+    return s1.to_bytes(4, "big") + s2.to_bytes(4, "big")
+
+
+def rewrite_wal_header(wal, magic=None, version=None, page_size=None, salts=None):
+    """Change fields of a -wal header and recompute its checksum, as SQLite would write it."""
+    data = bytearray(wal.read_bytes())
+    for offset, value in ((0, magic), (4, version), (8, page_size)):
+        if value is not None:
+            data[offset : offset + 4] = value.to_bytes(4, "big")
+    if salts is not None:
+        data[16:24] = salts
+    big_endian = int.from_bytes(data[0:4], "big") & 1
+    data[24:32] = reference_wal_checksum(bytes(data[:24]), big_endian)
+    wal.write_bytes(bytes(data))
+
+
+def verify_wal(capsys, root):
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    return code, entry
+
+
+def test_valid_wal_is_ok_with_frame_count(tmp_path, capsys):
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    frames = (wal.stat().st_size - 32) // (24 + 4096)
+    assert frames >= 1
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert code == 0
+    assert entry["wal"] == f"ok ({frames} frames)"
+    assert entry["tables"] == {"events": LIVE_ROWS_IN_WAL}
+
+
+def test_wal_of_random_bytes_is_invalid(tmp_path, capsys):
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    wal.write_bytes(random.Random(1).randbytes(wal.stat().st_size))
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    # SQLite ignores the garbage -wal: the database alone checks out, the WAL rows are lost
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": 0}
+    assert entry["wal"].startswith("invalid: bad magic number 0x")
+    assert code == 1
+
+
+def test_wal_with_other_page_size_is_invalid(tmp_path, capsys):
+    (tmp_path / "tree").mkdir()
+    make_db(tmp_path / "tree" / "app.db", rows=1)
+    _, other_wal = live_wal_copy(tmp_path / "live", tmp_path / "other", page_size=1024)
+    shutil.copyfile(other_wal, tmp_path / "tree" / "app.db-wal")
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == "invalid: page size 1024 does not match database page size 4096"
+    assert code == 1
+
+
+def test_wal_header_page_size_65536_matches_database_header_value_1(tmp_path, capsys):
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree", page_size=65536)
+    assert main_path.read_bytes()[16:18] == b"\x00\x01"
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"].startswith("ok (")
+    assert code == 0
+
+
+def test_wal_frames_from_another_database_are_invalid(tmp_path, capsys):
+    # header from the database's own -wal, frames from another database's -wal
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    _, other_wal = live_wal_copy(tmp_path / "other-live", tmp_path / "other", rows=3)
+    wal.write_bytes(wal.read_bytes()[:32] + other_wal.read_bytes()[32:])
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == "invalid: first frame salt does not match header salt"
+    assert code == 1
+
+
+def test_whole_wal_from_another_database_with_same_page_size_is_not_detected(tmp_path, capsys):
+    # A -wal header carries nothing that ties it to one database: a complete, self-consistent
+    # -wal of another database with the same page size passes every check and SQLite applies it.
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    _, other_wal = live_wal_copy(tmp_path / "other-live", tmp_path / "other", rows=3)
+    shutil.copyfile(other_wal, wal)
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"].startswith("ok (")
+    assert entry["tables"] == {"events": 3}
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    "change, expected",
+    [
+        (dict(version=3007001), "invalid: unsupported format version 3007001"),
+        (dict(magic=0x377F0684), "invalid: bad magic number 0x377f0684"),
+    ],
+    ids=["version", "magic"],
+)
+def test_wal_header_fields_are_checked(tmp_path, capsys, change, expected):
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    rewrite_wal_header(wal, **change)
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == expected
+    assert code == 1
+
+
+def test_wal_header_checksum_is_checked(tmp_path, capsys):
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    data = bytearray(wal.read_bytes())
+    data[12] ^= 0x01  # checkpoint sequence number, covered by the header checksum
+    wal.write_bytes(bytes(data))
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == "invalid: header checksum mismatch"
+    assert code == 1
+
+
+def test_big_endian_wal_checksum(tmp_path):
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    rewrite_wal_header(wal, magic=0x377F0683)
+    assert audit._check_wal(str(wal), str(main_path)).startswith("ok (")
+    data = bytearray(wal.read_bytes())
+    data[0:4] = (0x377F0682).to_bytes(4, "big")  # same checksum read as little-endian
+    wal.write_bytes(bytes(data))
+    assert audit._check_wal(str(wal), str(main_path)) == "invalid: header checksum mismatch"
+
+
+def test_wal_frame_count_stops_at_left_over_frames(tmp_path):
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    data = wal.read_bytes()
+    frames = (len(data) - 32) // (24 + 4096)
+    stale = bytearray(data[32 : 32 + 24 + 4096])
+    stale[8:16] = bytes(8)  # salts of an earlier WAL generation
+    wal.write_bytes(data + bytes(stale) + b"partial frame")
+    assert audit._check_wal(str(wal), str(main_path)) == f"ok ({frames} frames)"
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (b"", "empty"),
+        (b"\x37\x7f\x06\x82", "invalid: header truncated to 4 bytes"),
+        (None, "ok (0 frames)"),
+    ],
+    ids=["empty", "truncated", "header-only"],
+)
+def test_wal_without_frames(tmp_path, capsys, content, expected):
+    _, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    wal.write_bytes(wal.read_bytes()[:32] if content is None else content)
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == expected
+    assert code == (1 if expected.startswith("invalid") else 0)
+
+
+def test_unreadable_wal_copy_is_not_checked(tmp_path, monkeypatch, capsys):
+    live_wal_copy(tmp_path / "live", tmp_path / "tree")
+
+    def failing_check(wal_path, db_path):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(audit, "_check_wal", failing_check)
+    code, out, err = run_cli(capsys, "verify", str(tmp_path / "tree"), "--json")
+    assert code == 2
+    assert "not checked" in err
+    (entry,) = json.loads(out)
+    assert entry["integrity"] == "ok"
+    assert entry["wal"] == f"not-checked: [Errno {errno.EIO}] {os.strerror(errno.EIO)}"
+
+
+def test_wal_result_in_text_output(tmp_path, capsys):
+    live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    (tmp_path / "tree" / "app.db-wal").write_bytes(b"junk")
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path / "tree"))
+    assert code == 1
+    assert out.endswith("; wal: invalid: header truncated to 4 bytes\n")
 
 
 def test_module_entry_point_exit_codes(tree, tmp_path):

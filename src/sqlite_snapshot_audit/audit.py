@@ -2,7 +2,7 @@
 
 Nothing under the scanned directory is ever opened for writing: ``scan`` reads
 at most the first 16 bytes of each regular file (symlinks are reported, not followed), and ``verify`` only opens
-SQLite on copies placed in a temporary directory outside the scanned tree.
+SQLite (and reads -wal headers) on copies placed in a temporary directory outside the scanned tree.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import struct
 import tempfile
 import urllib.parse
 
@@ -28,6 +29,13 @@ VERIFIABLE = (STANDALONE, WAL_FAMILY)
 # integrity prefix for units the tool itself could not check (temporary directory problems)
 NOT_CHECKED = "not-checked: "
 COPY_CHUNK_SIZE = 1024 * 1024
+
+# https://www.sqlite.org/fileformat.html#the_write_ahead_log
+WAL_MAGIC_LITTLE_ENDIAN = 0x377F0682
+WAL_MAGIC_BIG_ENDIAN = 0x377F0683
+WAL_VERSION = 3007000
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
 
 
 class AuditError(Exception):
@@ -194,6 +202,63 @@ def _check_copy(db_path: str) -> tuple[str, dict]:
     return integrity, tables
 
 
+def _wal_checksum(data: bytes, big_endian: bool) -> tuple[int, int]:
+    """SQLite's WAL checksum (walChecksumBytes) over data, whose length is a multiple of 8."""
+    s1 = s2 = 0
+    words = struct.unpack((">" if big_endian else "<") + f"{len(data) // 4}I", data)
+    for i in range(0, len(words), 2):
+        s1 = (s1 + words[i] + s2) & 0xFFFFFFFF
+        s2 = (s2 + words[i + 1] + s1) & 0xFFFFFFFF
+    return s1, s2
+
+
+def _database_page_size(db_path: str) -> int | None:
+    with open(db_path, "rb") as f:
+        header = f.read(18)
+    if len(header) < 18:
+        return None
+    size = int.from_bytes(header[16:18], "big")
+    return 65536 if size == 1 else size
+
+
+def _check_wal(wal_path: str, db_path: str) -> str:
+    """Check a (copied) -wal file against its database, which SQLite does not do.
+
+    SQLite silently ignores a -wal with a bad header, so integrity_check says "ok" for a
+    database whose uncheckpointed transactions were lost. Returns "empty",
+    "ok (<N> frames)" or "invalid: <reason>"; N counts the complete frames, from the
+    first, that carry the header's salt (later frames are left over and ignored by SQLite).
+    """
+    wal_size = os.path.getsize(wal_path)
+    if wal_size == 0:
+        return "empty"
+    with open(wal_path, "rb") as f:
+        header = f.read(WAL_HEADER_SIZE)
+        if len(header) < WAL_HEADER_SIZE:
+            return f"invalid: header truncated to {len(header)} bytes"
+        magic, version, page_size, _, salt1, salt2, cksum1, cksum2 = struct.unpack(">8I", header)
+        if magic not in (WAL_MAGIC_LITTLE_ENDIAN, WAL_MAGIC_BIG_ENDIAN):
+            return f"invalid: bad magic number 0x{magic:08x}"
+        if version != WAL_VERSION:
+            return f"invalid: unsupported format version {version}"
+        if _wal_checksum(header[:24], magic == WAL_MAGIC_BIG_ENDIAN) != (cksum1, cksum2):
+            return "invalid: header checksum mismatch"
+        db_page_size = _database_page_size(db_path)
+        if page_size != db_page_size:
+            return f"invalid: page size {page_size} does not match database page size {db_page_size}"
+        frame_size = WAL_FRAME_HEADER_SIZE + page_size
+        frames = 0
+        while WAL_HEADER_SIZE + (frames + 1) * frame_size <= wal_size:
+            f.seek(WAL_HEADER_SIZE + frames * frame_size)
+            frame_salts = struct.unpack(">2I", f.read(WAL_FRAME_HEADER_SIZE)[8:16])
+            if frame_salts != (salt1, salt2):
+                if frames == 0:
+                    return "invalid: first frame salt does not match header salt"
+                break
+            frames += 1
+    return f"ok ({frames} frames)"
+
+
 def _copy_file(src_path: str, dst_path: str) -> None:
     """Copy src_path to dst_path; errors reading the source are raised as _SourceError.
 
@@ -229,7 +294,8 @@ def verify(root: str) -> list[dict]:
 
     Verified entries gain ``integrity`` and ``tables`` keys; other entries are
     returned as ``scan`` produced them. If the temporary copy cannot be made for a
-    reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``.
+    reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``. Checked
+    entries with a -wal sidecar also gain ``wal`` (see _check_wal).
     """
     entries = scan(root)
     if _inside(tempfile.gettempdir(), root):
@@ -256,13 +322,27 @@ def verify(root: str) -> list[dict]:
             except OSError as exc:
                 entry["integrity"], entry["tables"] = NOT_CHECKED + str(exc), {}
                 continue
+            wals = [rel for rel in entry["sidecars"] if rel.endswith("-wal")]
+            if wals:
+                # before SQLite opens the copy, so the -wal is read exactly as it was copied
+                try:
+                    wal = _check_wal(os.path.join(tmp, os.path.basename(wals[0])), copy)
+                except OSError as exc:
+                    wal = NOT_CHECKED + str(exc)
             entry["integrity"], entry["tables"] = _check_copy(copy)
+            if wals:
+                entry["wal"] = wal
     return entries
 
 
 def not_checked(entries: list[dict]) -> list[dict]:
     """Entries verify could not check because of the tool's environment (exit code 2)."""
-    return [e for e in entries if str(e.get("integrity", "")).startswith(NOT_CHECKED)]
+    return [
+        e
+        for e in entries
+        if str(e.get("integrity", "")).startswith(NOT_CHECKED)
+        or e.get("wal", "").startswith(NOT_CHECKED)
+    ]
 
 
 def has_problems(entries: list[dict]) -> bool:
@@ -271,5 +351,7 @@ def has_problems(entries: list[dict]) -> bool:
         if entry["class"] not in VERIFIABLE:
             return True
         if entry.get("integrity") != "ok":
+            return True
+        if entry.get("wal", "").startswith("invalid"):
             return True
     return False

@@ -51,6 +51,8 @@ def _format_text(entries: list[dict]) -> str:
                 line += "; tables: " + ", ".join(
                     f"{name}={count}" for name, count in entry["tables"].items()
                 )
+        if "wal" in entry:
+            line += f"; wal: {entry['wal']}"
         lines.append(_printable(line))
     return "".join(line + "\n" for line in lines)
 
