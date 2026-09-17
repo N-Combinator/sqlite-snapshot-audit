@@ -872,8 +872,8 @@ def test_wal_cut_short_inside_a_frame_is_invalid(tmp_path, capsys):
     assert code == 1
 
 
-def test_wal_without_a_final_commit_frame_is_invalid(tmp_path, capsys):
-    """Frames after the last commit frame are complete and checksummed, but never replayed."""
+def test_wal_without_a_final_commit_frame_is_ok_up_to_the_last_commit(tmp_path, capsys):
+    """Frames after the last commit frame are dropped by SQLite, so nothing committed is lost."""
     src, tree = tmp_path / "live", tmp_path / "tree"
     src.mkdir()
     tree.mkdir()
@@ -901,11 +901,52 @@ def test_wal_without_a_final_commit_frame_is_invalid(tmp_path, capsys):
     assert sqlite_replay_count(tree / "app.db", wal) == committed_frames
     code, entry = verify_wal(capsys, tree)
     assert entry["wal"] == (
-        f"invalid: {committed_frames} of {frames} frames will be replayed "
-        "(the last transaction has no commit frame)"
+        f"ok ({committed_frames} frames; {frames - committed_frames} further frames "
+        "will be dropped, as SQLite does: they were never committed)"
     )
+    assert entry["integrity"] == "ok"
     assert entry["tables"] == {"events": 25}
-    assert code == 1
+    assert code == 0
+
+
+def test_wal_with_a_torn_tail_after_a_commit_is_ok(tmp_path, capsys):
+    """A cp of a live WAL database ends mid-frame; the committed prefix still restores."""
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("PRAGMA cache_size=10")  # so an open transaction spills to the -wal
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("committed",)] * 25)
+        conn.commit()
+        committed_frames = wal_frames(Path(str(src / "app.db") + "-wal"))
+        conn.execute("BEGIN")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("in flight " * 40,)] * 2000)
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+        wal.write_bytes(wal.read_bytes()[:-1000])  # the copy caught the last frame half-written
+        conn.rollback()
+    finally:
+        conn.close()
+    frames = wal_frames(wal) + 1  # the trailing partial frame
+    assert frames > committed_frames
+    assert sqlite_replay_count(tree / "app.db", wal) == committed_frames
+    code, entry = verify_wal(capsys, tree)
+    assert entry["wal"] == (
+        f"ok ({committed_frames} frames; {frames - committed_frames} further frames will be "
+        f"dropped, as SQLite does: frame {frames} stops after {24 + 4096 - 1000} "
+        f"of {24 + 4096} bytes)"
+    )
+    # SQLite reads these two files exactly the same way, so the tool must not say "do not restore"
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": 25}
+    assert code == 0
 
 
 def test_wal_of_random_bytes_is_invalid(tmp_path, capsys):
