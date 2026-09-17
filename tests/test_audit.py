@@ -507,13 +507,33 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
             assert entry["reason"] == "symbolic link to a file; not followed"
 
     code, out, _ = run_cli(capsys, "verify", str(root), "--json")
-    assert code == 1
+    assert code == 0  # a symlink is reported, but is not a problem with the backup
     entries = json.loads(out)
     assert [(e["main"], e["class"]) for e in entries] == expected
     assert [e["main"] for e in entries if "integrity" in e] == ["real.db"]
     assert "elsewhere" not in out and str(outside) not in out
     assert tree_hashes(outside) == outside_before
     assert opened and not [p for p in opened if p.startswith(str(outside.resolve()))]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_skipped_symlink_does_not_change_verify_exit_code(tmp_path, capsys):
+    make_db(tmp_path / "a.db", rows=1)
+    (tmp_path / "link.db").symlink_to(tmp_path / "a.db")
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 0
+    assert [(e["main"], e["class"]) for e in json.loads(out)] == [
+        ("a.db", "standalone"),
+        ("link.db", "skipped-symlink"),
+    ]
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path))
+    assert code == 0
+    assert "skipped-symlink link.db" in out
+
+    (tmp_path / "notes.db").write_text("text")
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 1
+    assert len(json.loads(out)) == 3
 
 
 def test_dangling_symlink_is_ignored(tmp_path, capsys):
