@@ -65,10 +65,13 @@ def _warning(root: str, path: str, exc: OSError) -> str:
     return f"skipped {_relative(root, path)}: {exc.strerror or exc}"
 
 
-def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
-    """Return (regular files, symlinks to files) under root, relative and "/"-separated.
+def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str], set[str]]:
+    """Return (regular files, symlinks, dangling ones) under root, relative and "/"-separated.
 
-    Symlinks are never followed: their targets may lie outside root.
+    Symlinks are never followed: their targets may lie outside root. Whether a link
+    resolves is recorded but never decides whether it is reported -- a broken ``-wal``
+    link still belongs to its database, and dropping it would make that database look
+    standalone and be verified without the WAL it needs.
 
     A directory that cannot be read (a root-only ``lost+found``, say) is recorded in
     ``warnings`` and skipped; the rest of the tree is still audited. Only root itself
@@ -81,7 +84,7 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
             raise err
         warnings.append(_warning(root, err.filename, err))
 
-    regular, symlinks = [], []
+    regular, symlinks, dangling = [], [], set()
     for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
         dirnames.sort()
         for name in dirnames:
@@ -102,20 +105,22 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
                 warnings.append(_warning(root, full, exc))
                 continue
             if stat.S_ISLNK(st.st_mode):
-                # dangling symlinks point at nothing and are ignored
-                if os.path.exists(full):
-                    symlinks.append(rel)
+                # classified from lstat alone: a link that does not resolve is still a file
+                # in the tree and still part of its unit, it just cannot be restored from
+                symlinks.append(rel)
+                if not os.path.exists(full):
+                    dangling.add(rel)
                 continue
             if not stat.S_ISREG(st.st_mode):
                 # FIFOs, sockets, devices: reading them could block or be destructive
                 continue
             regular.append(rel)
-    return sorted(regular), sorted(symlinks)
+    return sorted(regular), sorted(symlinks), dangling
 
 
-def _note_links(reason: str, family: list[str], links: set[str]) -> str:
+def _note_links(reason: str, family: list[str], links: set[str], dangling: set[str]) -> str:
     """Add the sidecars of a unit that are symlinks (and so were not read) to its reason."""
-    linked = [rel for rel in family if rel in links]
+    linked = [rel + (" (dangling)" if rel in dangling else "") for rel in family if rel in links]
     if not linked:
         return reason
     return reason + "; symbolic link not followed: " + ", ".join(linked)
@@ -137,7 +142,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
         raise AuditError(f"not a directory: {root}")
 
     try:
-        files, symlinks = _walk_files(root, warnings)
+        files, symlinks, dangling = _walk_files(root, warnings)
     except OSError as exc:
         raise AuditError(str(exc)) from exc
 
@@ -180,7 +185,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
                 "main": main,
                 "sidecars": family,
                 "class": cls,
-                "reason": _note_links(reason, family, links),
+                "reason": _note_links(reason, family, links, dangling),
             }
         )
 
@@ -190,6 +195,10 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             continue
         if main in regular:
             reason = "main file exists but has no SQLite header"
+        elif main in dangling:
+            reason = "main path is a symbolic link whose target is missing"
+        elif main in links:
+            reason = "main path is a symbolic link; not followed, so no SQLite header was read"
         elif os.path.lexists(os.path.join(root, main)):
             reason = "main path exists but is not a regular file"
         else:
@@ -200,7 +209,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
                 "main": main,
                 "sidecars": family,
                 "class": ORPHAN_SIDECAR,
-                "reason": _note_links(reason, family, links),
+                "reason": _note_links(reason, family, links, dangling),
             }
         )
 
@@ -225,7 +234,12 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
                 # "skipped" tells a consumer that the class was not established, not that the
                 # target is junk, and keeps the class field to the four documented values
                 "class": NOT_SQLITE,
-                "reason": "symbolic link to a file; not followed, so no SQLite header was read",
+                "reason": (
+                    "dangling symbolic link (target is missing)"
+                    if main in dangling
+                    else "symbolic link to a file"
+                )
+                + "; not followed, so no SQLite header was read",
                 "skipped": SKIPPED_SYMLINK,
             }
         )

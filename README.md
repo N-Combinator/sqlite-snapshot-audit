@@ -57,16 +57,21 @@ Walks the directory recursively and prints one entry per database unit or proble
 - Databases are detected by the 16-byte header `SQLite format 3\0`, whatever their extension.
 - Paths are relative to the scanned directory, `/`-separated. The list is sorted by `main` (then `class`) and
   contains no timestamps or hostnames, so two runs over the same tree produce byte-identical output.
-- Only regular files are read: FIFOs, sockets and devices are skipped, and dangling symlinks are ignored.
-  Symlinks are never followed, because their target may lie outside the directory:
+- Only regular files are read: FIFOs, sockets and devices are skipped. Symlinks are never followed, because
+  their target may lie outside the directory, but they are always reported — a link is classified from
+  `lstat` alone, so a **broken link counts exactly like a working one** and never drops out of the listing:
   - a **symlinked directory** is not descended into, and each one is reported on stderr as
     `warning: symlinked directory not followed: <path>` — whatever it holds is not part of the audit;
   - a symlink named `<name>-wal` or `<name>-shm` is still grouped with its database by name (otherwise the
     database would look `standalone` and be verified without its WAL); the link is named in the entry's
-    `reason` and the unit fails `verify` (see `wal: symlink-skipped` below);
+    `reason` and the unit fails `verify` (see `wal: symlink-skipped` below). This holds for a dangling `-wal`
+    too — a `-wal` that arrived as a link to a path that does not exist on this host is the case where
+    dropping it would be most expensive, since the rows it holds are in no other file;
   - every other **file symlink** gets an entry of its own with `"skipped": "symlink"`. Its `class` is
     `not-sqlite`, because no header was read to classify it — the `skipped` key, not the class, says why. It
     is not a problem with the backup itself and does not make `verify` exit 1.
+  - a link whose target is missing says so in its `reason` (`dangling symbolic link (target is missing)`, or
+    `<name> (dangling)` in the list of a unit's unfollowed sidecars).
 - A path that cannot be read — an unreadable subdirectory such as a root-only `lost+found`, or a file whose
   permissions deny it — is skipped with a `warning: skipped <path>: <error>` line on stderr, and the rest of
   the tree is still audited. Only `<dir>` itself being unreadable is an error (exit 2). Warnings go to stderr,

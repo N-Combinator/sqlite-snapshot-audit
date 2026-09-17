@@ -542,7 +542,8 @@ def test_special_files_and_symlinked_dirs_are_skipped(tmp_path):
     (root / "dangling.db").symlink_to(tmp_path / "does-not-exist")
     make_db(root / "real.db", rows=1)
     warnings = []
-    assert [e["main"] for e in scan(str(root), warnings)] == ["real.db"]
+    # the FIFO is not read, but the dangling link is still a file in the tree and is reported
+    assert [e["main"] for e in scan(str(root), warnings)] == ["dangling.db", "real.db"]
     assert warnings == ["symlinked directory not followed: linked-dir"]
 
 
@@ -712,12 +713,65 @@ def test_skipped_symlink_does_not_change_verify_exit_code(tmp_path, capsys):
     assert len(json.loads(out)) == 3
 
 
-def test_dangling_symlink_is_ignored(tmp_path, capsys):
+def test_dangling_symlink_is_reported_like_any_other_link(tmp_path, capsys):
     make_db(tmp_path / "a.db", rows=1)
     (tmp_path / "dangling.db").symlink_to(tmp_path / "does-not-exist")
     code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
-    assert code == 0
-    assert [e["main"] for e in json.loads(out)] == ["a.db"]
+    assert code == 0  # a link that is not a sidecar still says nothing about a database
+    assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
+        ("a.db", "standalone", None),
+        ("dangling.db", "not-sqlite", "symlink"),
+    ]
+    assert by_main(json.loads(out))["dangling.db"]["reason"] == (
+        "dangling symbolic link (target is missing); "
+        "not followed, so no SQLite header was read"
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_dangling_wal_symlink_does_not_make_a_live_database_look_standalone(
+    tmp_path, capsys, live_wal_db
+):
+    """A -wal copied as a link whose target is absent (rsync -l, tar of a link, other host)."""
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    (root / "app.db-wal").symlink_to(tmp_path / "gone" / "app.db-wal")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"  # not standalone: the rows in the -wal are missing
+    assert entry["sidecars"] == ["app.db-wal"]
+    assert entry["reason"] == (
+        "SQLite database with -wal sidecar, no -shm; "
+        "symbolic link not followed: app.db-wal (dangling)"
+    )
+    assert entry["wal"] == "symlink-skipped"
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
+    assert code == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_tree_of_broken_links_is_not_reported_as_having_nothing_wrong(tmp_path, capsys):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "app.db").symlink_to(tmp_path / "gone" / "app.db")
+    (root / "app.db-wal").symlink_to(tmp_path / "gone" / "app.db-wal")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    assert code == 1  # a directory that would restore nothing is not a clean directory
+    assert [(e["main"], e["class"], e["reason"]) for e in json.loads(out)] == [
+        (
+            "app.db",
+            "not-sqlite",
+            "dangling symbolic link (target is missing); "
+            "not followed, so no SQLite header was read",
+        ),
+        (
+            "app.db",
+            "orphan-sidecar",
+            "main path is a symbolic link whose target is missing; "
+            "symbolic link not followed: app.db-wal (dangling)",
+        ),
+    ]
 
 
 def test_special_characters_in_names_survive_copy_and_uri(tmp_path):
