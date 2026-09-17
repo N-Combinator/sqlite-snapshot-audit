@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from .audit import AuditError, has_problems, scan, verify
+from .audit import AuditError, has_problems, not_checked, scan, verify
 
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         entries = verify(args.dir) if args.command == "verify" else scan(args.dir)
     except (AuditError, OSError) as exc:
-        # OSError: e.g. the temporary directory cannot be created
+        # OSError: e.g. no usable temporary directory exists at all
         print(f"sqlite-snapshot-audit: error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
@@ -72,6 +72,16 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.reconfigure(errors="backslashreplace")
         sys.stdout.write(_format_text(entries))
 
-    if args.command == "verify" and has_problems(entries):
+    if args.command != "verify":
+        return EXIT_OK
+    unchecked = not_checked(entries)
+    if unchecked:
+        print(
+            f"sqlite-snapshot-audit: error: {len(unchecked)} database unit(s) not checked "
+            "because the temporary copy failed; see their integrity field",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    if has_problems(entries):
         return EXIT_PROBLEMS
     return EXIT_OK

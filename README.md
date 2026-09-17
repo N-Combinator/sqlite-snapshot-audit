@@ -88,7 +88,11 @@ Those entries gain two keys:
 ```
 
 `integrity` is `"ok"`, the first row returned by `PRAGMA integrity_check`, or the error text if SQLite could
-not open or check the copy (e.g. `"database disk image is malformed"`). A table whose rows cannot be counted
+not open or check the copy (e.g. `"database disk image is malformed"`). If a file of the unit cannot be read
+from the audited tree (e.g. it vanished after the scan), `integrity` is `"copy failed: <error>"`. If the copy
+fails on the tool's side — the temporary directory is missing, full (`ENOSPC`), over quota (`EDQUOT`) or not
+writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
+`verify` exits 2. A table whose rows cannot be counted
 (corrupt pages, unavailable virtual-table module) is reported with a count of `null`. `orphan-sidecar` and
 `not-sqlite` entries are reported unchanged, without `integrity`/`tables`.
 
@@ -110,7 +114,7 @@ a non-SQLite `name.db` has a `name.db-wal`, both a `not-sqlite` and an `orphan-s
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
 | 0    | tree scanned                       | every entry is `standalone`/`wal-family` with `integrity: "ok"`                            |
 | 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry, or any integrity other than `ok` (all entries are still printed) |
-| 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same                                                                        |
+| 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same; also when `TMPDIR` is inside `<dir>`, or when any unit is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
 

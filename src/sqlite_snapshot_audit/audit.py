@@ -8,7 +8,6 @@ SQLite on copies placed in a temporary directory outside the scanned tree.
 from __future__ import annotations
 
 import os
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -25,9 +24,17 @@ NOT_SQLITE = "not-sqlite"
 
 VERIFIABLE = (STANDALONE, WAL_FAMILY)
 
+# integrity prefix for units the tool itself could not check (temporary directory problems)
+NOT_CHECKED = "not-checked: "
+COPY_CHUNK_SIZE = 1024 * 1024
+
 
 class AuditError(Exception):
     """Usage or IO problem that prevents auditing the tree (exit code 2)."""
+
+
+class _SourceError(Exception):
+    """OSError while reading a file under the audited tree, as opposed to the temp dir."""
 
 
 def _is_sqlite(path: str) -> bool:
@@ -168,6 +175,27 @@ def _check_copy(db_path: str) -> tuple[str, dict]:
     return integrity, tables
 
 
+def _copy_file(src_path: str, dst_path: str) -> None:
+    """Copy src_path to dst_path; errors reading the source are raised as _SourceError.
+
+    Any other OSError (creating or writing the copy: ENOSPC, EDQUOT, EACCES...) is the
+    temporary directory's problem and propagates unchanged.
+    """
+    try:
+        src = open(src_path, "rb")
+    except OSError as exc:
+        raise _SourceError(exc) from exc
+    with src, open(dst_path, "wb") as dst:
+        while True:
+            try:
+                chunk = src.read(COPY_CHUNK_SIZE)
+            except OSError as exc:
+                raise _SourceError(exc) from exc
+            if not chunk:
+                break
+            dst.write(chunk)
+
+
 def _inside(path: str, root: str) -> bool:
     path, root = os.path.realpath(path), os.path.realpath(root)
     try:
@@ -181,7 +209,8 @@ def verify(root: str) -> list[dict]:
     """Scan root, then check a temporary copy of every standalone/wal-family unit.
 
     Verified entries gain ``integrity`` and ``tables`` keys; other entries are
-    returned as ``scan`` produced them.
+    returned as ``scan`` produced them. If the temporary copy cannot be made for a
+    reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``.
     """
     entries = scan(root)
     if _inside(tempfile.gettempdir(), root):
@@ -192,19 +221,29 @@ def verify(root: str) -> list[dict]:
     for entry in entries:
         if entry["class"] not in VERIFIABLE:
             continue
-        with tempfile.TemporaryDirectory(prefix="sqlite-snapshot-audit-") as tmp:
+        try:
+            tmp_dir = tempfile.TemporaryDirectory(prefix="sqlite-snapshot-audit-")
+        except OSError as exc:
+            entry["integrity"], entry["tables"] = NOT_CHECKED + str(exc), {}
+            continue
+        with tmp_dir as tmp:
             copy = os.path.join(tmp, os.path.basename(entry["main"]))
             try:
                 for rel in [entry["main"], *entry["sidecars"]]:
-                    shutil.copyfile(
-                        os.path.join(root, rel), os.path.join(tmp, os.path.basename(rel))
-                    )
+                    _copy_file(os.path.join(root, rel), os.path.join(tmp, os.path.basename(rel)))
+            except _SourceError as exc:
+                entry["integrity"], entry["tables"] = f"copy failed: {exc}", {}
+                continue
             except OSError as exc:
-                entry["integrity"] = f"copy failed: {exc}"
-                entry["tables"] = {}
+                entry["integrity"], entry["tables"] = NOT_CHECKED + str(exc), {}
                 continue
             entry["integrity"], entry["tables"] = _check_copy(copy)
     return entries
+
+
+def not_checked(entries: list[dict]) -> list[dict]:
+    """Entries verify could not check because of the tool's environment (exit code 2)."""
+    return [e for e in entries if str(e.get("integrity", "")).startswith(NOT_CHECKED)]
 
 
 def has_problems(entries: list[dict]) -> bool:

@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlite_snapshot_audit import scan, verify
+from sqlite_snapshot_audit import audit, scan, verify
 from sqlite_snapshot_audit.cli import main
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -251,12 +252,91 @@ def test_verify_refuses_temp_dir_inside_audited_tree(tree, monkeypatch, capsys):
     assert tree_hashes(tree) == before
 
 
-def test_verify_exits_2_when_temp_dir_is_unusable(tree, tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-such-tmp"))
+def assert_not_checked_exit_2(capsys, tree, message):
+    before = tree_hashes(tree)
     code, out, err = run_cli(capsys, "verify", str(tree), "--json")
     assert code == 2
-    assert out == ""
-    assert "no-such-tmp" in err
+    assert "not checked" in err
+    entries = json.loads(out)
+    assert len(entries) == 8  # every discovered entry is still reported
+    for entry in entries:
+        if entry["class"] in ("standalone", "wal-family"):
+            assert entry["integrity"].startswith("not-checked: ")
+            assert message in entry["integrity"]
+            assert entry["tables"] == {}
+        else:
+            assert "integrity" not in entry
+    assert tree_hashes(tree) == before
+
+
+def test_verify_exits_2_when_temp_dir_is_missing(tree, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-such-tmp"))
+    assert_not_checked_exit_2(capsys, tree, "no-such-tmp")
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can write anywhere"
+)
+def test_verify_exits_2_when_temp_dir_is_not_writable(tree, tmp_path, monkeypatch, capsys):
+    scratch = tmp_path / "read-only-tmp"
+    scratch.mkdir()
+    scratch.chmod(0o500)
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    try:
+        assert_not_checked_exit_2(capsys, tree, os.strerror(errno.EACCES))
+    finally:
+        scratch.chmod(0o700)
+
+
+@pytest.mark.parametrize("err", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"])
+def test_verify_exits_2_when_temp_copy_cannot_be_written(tree, monkeypatch, capsys, err):
+    real_open = open
+
+    class FullDisk:
+        def __init__(self, f):
+            self._f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._f.close()
+
+        def write(self, data):
+            raise OSError(err, os.strerror(err))
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        f = real_open(path, mode, *args, **kwargs)
+        return FullDisk(f) if "w" in mode else f
+
+    # only the module's own open() calls (source reads and temp writes) are affected
+    monkeypatch.setattr(audit, "open", fake_open, raising=False)
+    assert_not_checked_exit_2(capsys, tree, os.strerror(err))
+
+
+def test_copy_distinguishes_source_errors_from_temp_errors(tmp_path):
+    make_db(tmp_path / "a.db", rows=1)
+    with pytest.raises(audit._SourceError):
+        audit._copy_file(str(tmp_path / "vanished.db"), str(tmp_path / "copy.db"))
+    with pytest.raises(OSError) as exc:
+        audit._copy_file(str(tmp_path / "a.db"), str(tmp_path / "no-such-dir" / "copy.db"))
+    assert not isinstance(exc.value, audit._SourceError)
+
+
+def test_source_file_vanishing_before_copy_is_a_backup_problem(tmp_path, monkeypatch, capsys):
+    make_db(tmp_path / "a.db", rows=1)
+    real_scan = audit.scan
+
+    def scan_then_delete(root):
+        entries = real_scan(root)
+        (tmp_path / "a.db").unlink()
+        return entries
+
+    monkeypatch.setattr(audit, "scan", scan_then_delete)
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 1
+    (entry,) = json.loads(out)
+    assert entry["integrity"].startswith("copy failed: ")
 
 
 def test_verify_exits_0_on_clean_tree(tmp_path, capsys):
