@@ -31,6 +31,8 @@ VERIFIABLE = (STANDALONE, WAL_FAMILY)
 
 # integrity prefix for units the tool itself could not check (temporary directory problems)
 NOT_CHECKED = "not-checked: "
+# wal value for a unit whose sidecar is a symlink, so the unit could not be copied as it stands
+SYMLINK_SKIPPED = "symlink-skipped"
 COPY_CHUNK_SIZE = 1024 * 1024
 
 # https://www.sqlite.org/fileformat.html#the_write_ahead_log
@@ -103,6 +105,14 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
     return sorted(regular), sorted(symlinks)
 
 
+def _note_links(reason: str, family: list[str], links: set[str]) -> str:
+    """Add the sidecars of a unit that are symlinks (and so were not read) to its reason."""
+    linked = [rel for rel in family if rel in links]
+    if not linked:
+        return reason
+    return reason + "; symbolic link not followed: " + ", ".join(linked)
+
+
 def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
     """Classify every SQLite database, sidecar, would-be database and file symlink under root.
 
@@ -130,12 +140,17 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             continue
         (databases.add if is_database else others.append)(rel)
 
+    # A sidecar is recognised by its name, symlink or not: leaving a symlinked -wal out of
+    # the family would make its database look standalone and be verified without its WAL.
+    links = set(symlinks)
     sidecars: dict[str, list[str]] = {}
     not_sqlite = []
-    for rel in others:
-        if rel.endswith(SIDECAR_SUFFIXES):
+    adopted = set()  # symlinks reported as part of a unit instead of on their own
+    for rel in sorted(others + symlinks):
+        if rel.endswith(SIDECAR_SUFFIXES) and len(os.path.basename(rel)) > len("-wal"):
             sidecars.setdefault(rel[: -len("-wal")], []).append(rel)
-        elif rel.lower().endswith(DB_EXTENSIONS):
+            adopted.add(rel)
+        elif rel not in links and rel.lower().endswith(DB_EXTENSIONS):
             not_sqlite.append(rel)
 
     entries = []
@@ -149,7 +164,14 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             cls, reason = WAL_FAMILY, "SQLite database with -wal sidecar, no -shm"
         else:
             cls, reason = WAL_FAMILY, "SQLite database with -shm sidecar but no -wal"
-        entries.append({"main": main, "sidecars": family, "class": cls, "reason": reason})
+        entries.append(
+            {
+                "main": main,
+                "sidecars": family,
+                "class": cls,
+                "reason": _note_links(reason, family, links),
+            }
+        )
 
     regular = set(files)
     for main, family in sidecars.items():
@@ -161,8 +183,14 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             reason = "main path exists but is not a regular file"
         else:
             reason = "main file is missing"
+        family = sorted(family)
         entries.append(
-            {"main": main, "sidecars": sorted(family), "class": ORPHAN_SIDECAR, "reason": reason}
+            {
+                "main": main,
+                "sidecars": family,
+                "class": ORPHAN_SIDECAR,
+                "reason": _note_links(reason, family, links),
+            }
         )
 
     for main in not_sqlite:
@@ -175,6 +203,9 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
         entries.append({"main": main, "sidecars": [], "class": NOT_SQLITE, "reason": reason})
 
     for main in symlinks:
+        if main in adopted:
+            # already reported in the sidecars of the unit it belongs to
+            continue
         entries.append(
             {
                 "main": main,
@@ -357,7 +388,8 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
     Verified entries gain ``integrity`` and ``tables`` keys; other entries are
     returned as ``scan`` produced them. If the temporary copy cannot be made for a
     reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``. Checked
-    entries with a -wal sidecar also gain ``wal`` (see _check_wal).
+    entries with a -wal sidecar also gain ``wal`` (see _check_wal); so do units whose
+    sidecar is a symlink, which is not followed and so cannot be checked at all.
     """
     entries = scan(root, warnings)
     if _inside(tempfile.gettempdir(), root):
@@ -375,8 +407,12 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             continue
         with tmp_dir as tmp:
             copy = os.path.join(tmp, os.path.basename(entry["main"]))
+            # a symlinked sidecar may point outside root, so it is neither read nor copied;
+            # the unit is then not the one that would be restored, whatever the copy says
+            linked = [rel for rel in entry["sidecars"] if os.path.islink(os.path.join(root, rel))]
+            copied = [rel for rel in entry["sidecars"] if rel not in linked]
             try:
-                for rel in [entry["main"], *entry["sidecars"]]:
+                for rel in [entry["main"], *copied]:
                     _copy_file(os.path.join(root, rel), os.path.join(tmp, os.path.basename(rel)))
             except _SourceError as exc:
                 entry["integrity"], entry["tables"] = f"copy failed: {exc}", {}
@@ -384,15 +420,18 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             except OSError as exc:
                 entry["integrity"], entry["tables"] = NOT_CHECKED + str(exc), {}
                 continue
-            wals = [rel for rel in entry["sidecars"] if rel.endswith("-wal")]
-            if wals:
+            wal = None
+            wals = [rel for rel in copied if rel.endswith("-wal")]
+            if linked:
+                wal = SYMLINK_SKIPPED
+            elif wals:
                 # before SQLite opens the copy, so the -wal is read exactly as it was copied
                 try:
                     wal = _check_wal(os.path.join(tmp, os.path.basename(wals[0])), copy)
                 except OSError as exc:
                     wal = NOT_CHECKED + str(exc)
             entry["integrity"], entry["tables"] = _check_copy(copy)
-            if wals:
+            if wal is not None:
                 entry["wal"] = wal
     return entries
 
@@ -417,6 +456,8 @@ def has_problems(entries: list[dict]) -> bool:
             return True
         if entry.get("integrity") != "ok":
             return True
-        if entry.get("wal", "").startswith("invalid"):
+        wal = entry.get("wal", "")
+        if wal and not (wal == "empty" or wal.startswith(("ok", NOT_CHECKED))):
+            # "invalid: ..." or "symlink-skipped": the -wal that would be replayed is not sound
             return True
     return False

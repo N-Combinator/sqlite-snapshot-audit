@@ -508,6 +508,15 @@ def test_sidecar_next_to_non_sqlite_main_and_shm_without_wal(tmp_path):
     assert entries["walonly.db"]["wal"] == "empty"
 
 
+def test_file_named_exactly_like_a_suffix_is_not_a_sidecar(tmp_path):
+    """`-wal` on its own has no main file name in front of it, so it is just a file."""
+    (tmp_path / "-wal").write_bytes(b"\x00")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "-shm").write_bytes(b"\x00")
+    make_db(tmp_path / "a.db", rows=1)
+    assert [(e["main"], e["class"]) for e in scan(str(tmp_path))] == [("a.db", "standalone")]
+
+
 def test_header_detection_ignores_extension_and_sidecar_names(tmp_path):
     make_db(tmp_path / "no_extension", rows=1)
     make_db(tmp_path / "UPPER.DB", rows=1)
@@ -559,8 +568,8 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
 
     expected = [
         ("link.db", "skipped-symlink"),
-        ("real.db", "standalone"),  # the symlinked -wal is not grouped with it
-        ("real.db-wal", "skipped-symlink"),
+        # the symlinked -wal is grouped by name, so the database is not called standalone
+        ("real.db", "wal-family"),
         ("sub/inside.sqlite", "skipped-symlink"),
         ("sub/notes.txt", "skipped-symlink"),
     ]
@@ -570,15 +579,74 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
         if entry["class"] == "skipped-symlink":
             assert entry["sidecars"] == []
             assert entry["reason"] == "symbolic link to a file; not followed"
+    assert by_main(entries)["real.db"]["sidecars"] == ["real.db-wal"]
+    assert by_main(entries)["real.db"]["reason"] == (
+        "SQLite database with -wal sidecar, no -shm; symbolic link not followed: real.db-wal"
+    )
 
     code, out, _ = run_cli(capsys, "verify", str(root), "--json")
-    assert code == 0  # a symlink is reported, but is not a problem with the backup
+    assert code == 1  # the -wal that would be replayed was not checked
     entries = json.loads(out)
     assert [(e["main"], e["class"]) for e in entries] == expected
     assert [e["main"] for e in entries if "integrity" in e] == ["real.db"]
+    assert by_main(entries)["real.db"]["wal"] == "symlink-skipped"
     assert "elsewhere" not in out and str(outside) not in out
     assert tree_hashes(outside) == outside_before
     assert opened and not [p for p in opened if p.startswith(str(outside.resolve()))]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlinked_wal_does_not_make_a_live_database_look_standalone(tmp_path, capsys, live_wal_db):
+    """The reported repro: a real database whose -wal is a symlink to rows outside the tree."""
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    (root / "app.db-wal").symlink_to(str(live_wal_db) + "-wal")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"
+    assert entry["sidecars"] == ["app.db-wal"]
+    assert entry["wal"] == "symlink-skipped"
+    # without its -wal the copy misses the uncheckpointed rows, and that must not pass
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
+    assert code == 1
+
+    code, out, _ = run_cli(capsys, "verify", str(root))
+    assert code == 1
+    assert "wal: symlink-skipped" in out
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlinked_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, live_wal_db):
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
+    (root / "app.db-shm").symlink_to(str(live_wal_db) + "-shm")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    assert entry["sidecars"] == ["app.db-shm", "app.db-wal"]
+    assert entry["wal"] == "symlink-skipped"  # the unit could not be copied as it stands
+    assert code == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlinked_sidecar_without_a_main_file_is_an_orphan(tmp_path, capsys):
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "elsewhere.db-wal").write_bytes(b"\x00" * 32)
+    (root / "gone.db-wal").symlink_to(tmp_path / "elsewhere.db-wal")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    assert code == 1
+    assert [(e["main"], e["sidecars"], e["class"], e["reason"]) for e in json.loads(out)] == [
+        (
+            "gone.db",
+            ["gone.db-wal"],
+            "orphan-sidecar",
+            "main file is missing; symbolic link not followed: gone.db-wal",
+        )
+    ]
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
