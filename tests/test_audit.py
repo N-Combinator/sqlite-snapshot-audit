@@ -675,6 +675,101 @@ def test_symlinked_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, liv
     assert code == 1
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable files"
+)
+def test_unreadable_wal_does_not_make_a_live_database_look_standalone(
+    tmp_path, capsys, live_wal_db
+):
+    """A -wal whose permissions deny reading it (root-owned dump, restore under another uid)."""
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
+    (root / "app.db-wal").chmod(0)
+    try:
+        warnings = []
+        entries = scan(str(root), warnings)
+        code, out, err = run_cli(capsys, "verify", str(root), "--json")
+        text_code, text_out, _ = run_cli(capsys, "verify", str(root))
+    finally:
+        (root / "app.db-wal").chmod(0o600)
+    # the sidecar is grouped by name, before and independently of any read
+    assert [(e["main"], e["sidecars"], e["class"]) for e in entries] == [
+        ("app.db", ["app.db-wal"], "wal-family")
+    ]
+    assert warnings == []
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"
+    assert entry["wal"] == f"unreadable: app.db-wal: {os.strerror(errno.EACCES)}"
+    # the copy is the main file alone, so its row count misses the uncheckpointed rows
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
+    assert code == 1
+    assert err == ""
+    assert text_code == 1
+    assert "wal: unreadable: app.db-wal" in text_out
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable files"
+)
+def test_unreadable_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, live_wal_db):
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
+    (root / "app.db-shm").write_bytes(b"\x00" * 32)
+    (root / "app.db-shm").chmod(0)
+    try:
+        code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    finally:
+        (root / "app.db-shm").chmod(0o600)
+    (entry,) = json.loads(out)
+    assert entry["sidecars"] == ["app.db-shm", "app.db-wal"]
+    assert entry["wal"].startswith("unreadable: app.db-shm: ")
+    assert code == 1  # the unit could not be copied as it stands
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable files"
+)
+def test_unreadable_main_next_to_a_sidecar_is_an_orphan(tmp_path, capsys, live_wal_db):
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
+    (root / "app.db").chmod(0)
+    try:
+        code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    finally:
+        (root / "app.db").chmod(0o600)
+    assert code == 1
+    assert [(e["main"], e["sidecars"], e["class"], e["reason"]) for e in json.loads(out)] == [
+        (
+            "app.db",
+            ["app.db-wal"],
+            "orphan-sidecar",
+            f"main file could not be read: {os.strerror(errno.EACCES)}",
+        )
+    ]
+    assert err == (
+        f"sqlite-snapshot-audit: warning: skipped app.db: {os.strerror(errno.EACCES)}\n"
+    )
+
+
+def test_sidecar_names_are_grouped_before_any_header_is_read(tmp_path):
+    """The name decides the unit; a header is never read from a -wal/-shm path."""
+    make_db(tmp_path / "a.db", rows=1)
+    # a full database misnamed as a sidecar is still the -wal of "a.db", not a database
+    make_db(tmp_path / "a.db-wal", rows=1)
+    make_db(tmp_path / "lonely.db-shm", rows=1)
+    assert [(e["main"], e["sidecars"], e["class"]) for e in scan(str(tmp_path))] == [
+        ("a.db", ["a.db-wal"], "wal-family"),
+        ("lonely.db", ["lonely.db-shm"], "orphan-sidecar"),
+    ]
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
 def test_symlinked_sidecar_without_a_main_file_is_an_orphan(tmp_path, capsys):
     root = tmp_path / "root"
