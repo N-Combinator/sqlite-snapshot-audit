@@ -1,7 +1,7 @@
 """Discover SQLite backup units under a directory and verify copies of them.
 
 Nothing under the scanned directory is ever opened for writing: ``scan`` reads
-at most the first 16 bytes of each regular file, and ``verify`` only opens
+at most the first 16 bytes of each regular file (symlinks are reported, not followed), and ``verify`` only opens
 SQLite on copies placed in a temporary directory outside the scanned tree.
 """
 
@@ -21,6 +21,7 @@ STANDALONE = "standalone"
 WAL_FAMILY = "wal-family"
 ORPHAN_SIDECAR = "orphan-sidecar"
 NOT_SQLITE = "not-sqlite"
+SKIPPED_SYMLINK = "skipped-symlink"
 
 VERIFIABLE = (STANDALONE, WAL_FAMILY)
 
@@ -42,32 +43,40 @@ def _is_sqlite(path: str) -> bool:
         return f.read(len(SQLITE_HEADER)) == SQLITE_HEADER
 
 
-def _walk_regular_files(root: str) -> list[str]:
-    """Return paths of regular files under root, relative and "/"-separated."""
+def _walk_files(root: str) -> tuple[list[str], list[str]]:
+    """Return (regular files, symlinks to files) under root, relative and "/"-separated.
+
+    Symlinks are never followed: their targets may lie outside root.
+    """
 
     def raise_error(err: OSError) -> None:
         raise err
 
-    found = []
+    regular, symlinks = [], []
     for dirpath, dirnames, filenames in os.walk(root, onerror=raise_error):
         dirnames.sort()
         for name in filenames:
             full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
             try:
-                st = os.stat(full)
+                st = os.lstat(full)
             except FileNotFoundError:
-                # dangling symlink, or the file vanished while walking
+                # the file vanished while walking
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                # dangling symlinks point at nothing and are ignored
+                if os.path.exists(full):
+                    symlinks.append(rel)
                 continue
             if not stat.S_ISREG(st.st_mode):
                 # FIFOs, sockets, devices: reading them could block or be destructive
                 continue
-            rel = os.path.relpath(full, root)
-            found.append(rel.replace(os.sep, "/"))
-    return sorted(found)
+            regular.append(rel)
+    return sorted(regular), sorted(symlinks)
 
 
 def scan(root: str) -> list[dict]:
-    """Classify every SQLite database, sidecar and would-be database under root.
+    """Classify every SQLite database, sidecar, would-be database and file symlink under root.
 
     Returns entries sorted by ``main`` (then ``class``); paths are relative to root.
     Raises AuditError if root is not a directory or a file cannot be read.
@@ -76,7 +85,7 @@ def scan(root: str) -> list[dict]:
         raise AuditError(f"not a directory: {root}")
 
     try:
-        files = _walk_regular_files(root)
+        files, symlinks = _walk_files(root)
         databases = set()
         others = []
         for rel in files:
@@ -129,6 +138,16 @@ def scan(root: str) -> list[dict]:
             raise AuditError(str(exc)) from exc
         reason = "empty file" if empty else "database file name but no SQLite header"
         entries.append({"main": main, "sidecars": [], "class": NOT_SQLITE, "reason": reason})
+
+    for main in symlinks:
+        entries.append(
+            {
+                "main": main,
+                "sidecars": [],
+                "class": SKIPPED_SYMLINK,
+                "reason": "symbolic link to a file; not followed",
+            }
+        )
 
     entries.sort(key=lambda e: (e["main"], e["class"]))
     return entries

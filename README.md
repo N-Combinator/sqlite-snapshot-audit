@@ -57,9 +57,12 @@ Walks the directory recursively and prints one entry per database unit or proble
 - Databases are detected by the 16-byte header `SQLite format 3\0`, whatever their extension.
 - Paths are relative to the scanned directory, `/`-separated. The list is sorted by `main` (then `class`) and
   contains no timestamps or hostnames, so two runs over the same tree produce byte-identical output.
-- Only regular files are considered: FIFOs, sockets and devices are skipped, symlinked directories are not
-  followed, and dangling symlinks are ignored.
-- Without `--json`, the same entries are printed one per line.
+- Only regular files are read: FIFOs, sockets and devices are skipped, symlinked directories are not
+  followed, and dangling symlinks are ignored. Symlinks to files are never followed (their target may lie
+  outside the directory): each one is reported as a `skipped-symlink` entry and is neither checked nor grouped
+  as a sidecar.
+- Without `--json`, the same entries are printed one per line; bytes in file names that are not valid UTF-8
+  are shown as `\xNN` escapes.
 
 ### `verify`
 
@@ -92,9 +95,11 @@ not open or check the copy (e.g. `"database disk image is malformed"`). If a fil
 from the audited tree (e.g. it vanished after the scan), `integrity` is `"copy failed: <error>"`. If the copy
 fails on the tool's side — the temporary directory is missing, full (`ENOSPC`), over quota (`EDQUOT`) or not
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
-`verify` exits 2. A table whose rows cannot be counted
-(corrupt pages, unavailable virtual-table module) is reported with a count of `null`. `orphan-sidecar` and
-`not-sqlite` entries are reported unchanged, without `integrity`/`tables`.
+`verify` exits 2.
+
+A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
+of `null`. `orphan-sidecar`, `not-sqlite` and `skipped-symlink` entries are reported unchanged, without
+`integrity`/`tables`.
 
 ## Classes
 
@@ -104,6 +109,7 @@ writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"n
 | `wal-family`     | SQLite database with its `-wal` (`-shm` optional; a lone `-shm` next to a database is also grouped here) | the database                      |
 | `orphan-sidecar` | a `-wal` and/or `-shm` whose main file is missing or is not SQLite                                   | the expected (missing) main path  |
 | `not-sqlite`     | a file named `*.db`, `*.sqlite` or `*.sqlite3` (any case) without the SQLite header, including empty files | the file                          |
+| `skipped-symlink` | a symbolic link to a file (any name); not followed, so its target is neither read nor checked       | the link                          |
 
 A file with the SQLite header is always treated as a database, even if its name ends in `-wal` or `-shm`. When
 a non-SQLite `name.db` has a `name.db-wal`, both a `not-sqlite` and an `orphan-sidecar` entry are reported.
@@ -113,7 +119,7 @@ a non-SQLite `name.db` has a `name.db-wal`, both a `not-sqlite` and an `orphan-s
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
 | 0    | tree scanned                       | every entry is `standalone`/`wal-family` with `integrity: "ok"`                            |
-| 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry, or any integrity other than `ok` (all entries are still printed) |
+| 1    | —                                  | any `orphan-sidecar`, `not-sqlite` or `skipped-symlink` entry, or any integrity other than `ok` (all entries are still printed) |
 | 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same; also when `TMPDIR` is inside `<dir>`, or when any unit is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools

@@ -460,6 +460,62 @@ def test_special_files_and_symlinked_dirs_are_skipped(tmp_path):
     assert [e["main"] for e in scan(str(root))] == ["real.db"]
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    make_db(outside / "elsewhere.db", rows=1)
+    (outside / "elsewhere.db-wal").write_bytes(b"\x00")
+    make_db(root / "real.db", rows=2)
+    (root / "link.db").symlink_to(outside / "elsewhere.db")
+    (root / "real.db-wal").symlink_to(outside / "elsewhere.db-wal")
+    (root / "sub").mkdir()
+    (root / "sub" / "inside.sqlite").symlink_to(root / "real.db")
+    (root / "sub" / "notes.txt").symlink_to(outside / "elsewhere.db")
+    outside_before = tree_hashes(outside)
+    opened = []
+    real_open = open
+
+    def recording_open(path, *args, **kwargs):
+        opened.append(os.path.realpath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(audit, "open", recording_open, raising=False)
+
+    expected = [
+        ("link.db", "skipped-symlink"),
+        ("real.db", "standalone"),  # the symlinked -wal is not grouped with it
+        ("real.db-wal", "skipped-symlink"),
+        ("sub/inside.sqlite", "skipped-symlink"),
+        ("sub/notes.txt", "skipped-symlink"),
+    ]
+    entries = scan(str(root))
+    assert [(e["main"], e["class"]) for e in entries] == expected
+    for entry in entries:
+        if entry["class"] == "skipped-symlink":
+            assert entry["sidecars"] == []
+            assert entry["reason"] == "symbolic link to a file; not followed"
+
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    assert code == 1
+    entries = json.loads(out)
+    assert [(e["main"], e["class"]) for e in entries] == expected
+    assert [e["main"] for e in entries if "integrity" in e] == ["real.db"]
+    assert "elsewhere" not in out and str(outside) not in out
+    assert tree_hashes(outside) == outside_before
+    assert opened and not [p for p in opened if p.startswith(str(outside.resolve()))]
+
+
+def test_dangling_symlink_is_ignored(tmp_path, capsys):
+    make_db(tmp_path / "a.db", rows=1)
+    (tmp_path / "dangling.db").symlink_to(tmp_path / "does-not-exist")
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 0
+    assert [e["main"] for e in json.loads(out)] == ["a.db"]
+
+
 def test_special_characters_in_names_survive_copy_and_uri(tmp_path):
     make_db(tmp_path / "we?ird #name%20.db", rows=5)
     (entry,) = verify(str(tmp_path))
