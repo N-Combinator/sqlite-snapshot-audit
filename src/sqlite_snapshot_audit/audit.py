@@ -133,7 +133,7 @@ def _quote_identifier(name: str) -> str:
 
 def _check_copy(db_path: str) -> tuple[str, dict]:
     """Run integrity_check and count rows per table on a (copied) database."""
-    uri = "file:" + urllib.parse.quote(db_path) + "?mode=ro"
+    uri = "file:" + urllib.parse.quote(os.fsencode(db_path)) + "?mode=ro"
     tables: dict[str, int | None] = {}
     try:
         conn = sqlite3.connect(uri, uri=True)

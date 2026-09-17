@@ -76,9 +76,10 @@ def tree(live_wal_db):
     # Garbage over the table's root page: SQLite raises "database disk image is malformed".
     make_db(root / "corrupt.sqlite3", rows=60)
     corrupt_page(root / "corrupt.sqlite3", 2, 0, b"\xa5" * 2048)
-    # A broken cell pointer on a leaf page: integrity_check returns an error message.
+    # Zeroed cells inside a leaf page: integrity_check returns an error message. (Corruption
+    # that points outside the page is avoided: SQLite's result then depends on process memory.)
     make_db(root / "bad-cell.db", rows=60)
-    corrupt_page(root / "bad-cell.db", 3, 8, b"\xff\xff\xff\xff")
+    corrupt_page(root / "bad-cell.db", 3, 3000, b"\x00" * 500)
     (root / "readme.txt").write_text("not a database, ignored\n")
     return root
 
@@ -250,6 +251,14 @@ def test_verify_refuses_temp_dir_inside_audited_tree(tree, monkeypatch, capsys):
     assert tree_hashes(tree) == before
 
 
+def test_verify_exits_2_when_temp_dir_is_unusable(tree, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-such-tmp"))
+    code, out, err = run_cli(capsys, "verify", str(tree), "--json")
+    assert code == 2
+    assert out == ""
+    assert "no-such-tmp" in err
+
+
 def test_verify_exits_0_on_clean_tree(tmp_path, capsys):
     make_db(tmp_path / "a.db", rows=1)
     conn = sqlite3.connect(tmp_path / "b.sqlite")
@@ -376,6 +385,32 @@ def test_special_characters_in_names_survive_copy_and_uri(tmp_path):
     (entry,) = verify(str(tmp_path))
     assert entry["integrity"] == "ok"
     assert entry["tables"] == {"items": 5}
+
+
+def test_wal_mode_database_without_sidecars(tmp_path):
+    conn = sqlite3.connect(tmp_path / "closed.db")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()  # clean close checkpoints and removes -wal/-shm
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["closed.db"]
+    (entry,) = verify(str(tmp_path))
+    assert (entry["class"], entry["integrity"], entry["tables"]) == ("standalone", "ok", {"t": 1})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["closed.db"]
+
+
+def test_non_utf8_file_name(tmp_path, capsys):
+    name = os.fsdecode(b"caf\xe9.db")
+    try:
+        make_db(tmp_path / name, rows=1)
+    except (OSError, UnicodeEncodeError, sqlite3.Error):
+        pytest.skip("file system does not accept non-UTF-8 names")
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    assert code == 0
+    (entry,) = json.loads(out)
+    assert entry["main"] == name
+    assert entry["tables"] == {"items": 1}
 
 
 def test_module_entry_point_exit_codes(tree, tmp_path):

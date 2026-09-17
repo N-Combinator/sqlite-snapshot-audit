@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         entries = verify(args.dir) if args.command == "verify" else scan(args.dir)
-    except AuditError as exc:
+    except (AuditError, OSError) as exc:
+        # OSError: e.g. the temporary directory cannot be created
         print(f"sqlite-snapshot-audit: error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
