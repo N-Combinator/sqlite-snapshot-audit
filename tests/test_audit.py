@@ -16,6 +16,8 @@ from sqlite_snapshot_audit import audit, scan, verify
 from sqlite_snapshot_audit.cli import main
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+# the four classes the tool promises; "skipped" carries the symlink fact instead of a fifth one
+CONTRACT_CLASSES = ("standalone", "wal-family", "orphan-sidecar", "not-sqlite")
 LIVE_ROWS_COMMITTED_BEFORE_WAL = 2
 LIVE_ROWS_IN_WAL = 25
 
@@ -599,18 +601,26 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(audit, "open", recording_open, raising=False)
 
     expected = [
-        ("link.db", "skipped-symlink"),
+        ("link.db", "not-sqlite"),
         # the symlinked -wal is grouped by name, so the database is not called standalone
         ("real.db", "wal-family"),
-        ("sub/inside.sqlite", "skipped-symlink"),
-        ("sub/notes.txt", "skipped-symlink"),
+        ("sub/inside.sqlite", "not-sqlite"),
+        ("sub/notes.txt", "not-sqlite"),
     ]
     entries = scan(str(root))
     assert [(e["main"], e["class"]) for e in entries] == expected
+    assert [e["main"] for e in entries if e.get("skipped")] == [
+        "link.db",
+        "sub/inside.sqlite",
+        "sub/notes.txt",
+    ]
     for entry in entries:
-        if entry["class"] == "skipped-symlink":
+        if entry.get("skipped"):
+            assert entry["skipped"] == "symlink"
             assert entry["sidecars"] == []
-            assert entry["reason"] == "symbolic link to a file; not followed"
+            assert entry["reason"] == (
+                "symbolic link to a file; not followed, so no SQLite header was read"
+            )
     assert by_main(entries)["real.db"]["sidecars"] == ["real.db-wal"]
     assert by_main(entries)["real.db"]["reason"] == (
         "SQLite database with -wal sidecar, no -shm; symbolic link not followed: real.db-wal"
@@ -622,6 +632,7 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
     assert [(e["main"], e["class"]) for e in entries] == expected
     assert [e["main"] for e in entries if "integrity" in e] == ["real.db"]
     assert by_main(entries)["real.db"]["wal"] == "symlink-skipped"
+    assert all(e["class"] in CONTRACT_CLASSES for e in entries)
     assert "elsewhere" not in out and str(outside) not in out
     assert tree_hashes(outside) == outside_before
     assert opened and not [p for p in opened if p.startswith(str(outside.resolve()))]
@@ -687,13 +698,13 @@ def test_skipped_symlink_does_not_change_verify_exit_code(tmp_path, capsys):
     (tmp_path / "link.db").symlink_to(tmp_path / "a.db")
     code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
     assert code == 0
-    assert [(e["main"], e["class"]) for e in json.loads(out)] == [
-        ("a.db", "standalone"),
-        ("link.db", "skipped-symlink"),
+    assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
+        ("a.db", "standalone", None),
+        ("link.db", "not-sqlite", "symlink"),
     ]
     code, out, _ = run_cli(capsys, "verify", str(tmp_path))
     assert code == 0
-    assert "skipped-symlink link.db" in out
+    assert "not-sqlite      link.db" in out and "skipped: symlink" in out
 
     (tmp_path / "notes.db").write_text("text")
     code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")

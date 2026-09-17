@@ -25,10 +25,11 @@ STANDALONE = "standalone"
 WAL_FAMILY = "wal-family"
 ORPHAN_SIDECAR = "orphan-sidecar"
 NOT_SQLITE = "not-sqlite"
-SKIPPED_SYMLINK = "skipped-symlink"
 
 VERIFIABLE = (STANDALONE, WAL_FAMILY)
 
+# value of the "skipped" key on an entry whose own path is a symbolic link that was not followed
+SKIPPED_SYMLINK = "symlink"
 # integrity prefix for units the tool itself could not check (temporary directory problems)
 NOT_CHECKED = "not-checked: "
 # wal value for a unit whose sidecar is a symlink, so the unit could not be copied as it stands
@@ -122,6 +123,9 @@ def _note_links(reason: str, family: list[str], links: set[str]) -> str:
 
 def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
     """Classify every SQLite database, sidecar, would-be database and file symlink under root.
+
+    A file symlink that is not a sidecar is reported with ``"skipped": "symlink"`` and the
+    ``not-sqlite`` class: it is not followed, so no header was read to classify it.
 
     Returns entries sorted by ``main`` (then ``class``); paths are relative to root.
     Paths that cannot be read are appended to ``warnings`` and left out of the entries;
@@ -217,8 +221,12 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             {
                 "main": main,
                 "sidecars": [],
-                "class": SKIPPED_SYMLINK,
-                "reason": "symbolic link to a file; not followed",
+                # every class is decided by reading a header, which a symlink is never read for;
+                # "skipped" tells a consumer that the class was not established, not that the
+                # target is junk, and keeps the class field to the four documented values
+                "class": NOT_SQLITE,
+                "reason": "symbolic link to a file; not followed, so no SQLite header was read",
+                "skipped": SKIPPED_SYMLINK,
             }
         )
 
@@ -511,8 +519,8 @@ def not_checked(entries: list[dict]) -> list[dict]:
 def has_problems(entries: list[dict]) -> bool:
     """True if verify should exit 1 for these entries."""
     for entry in entries:
-        if entry["class"] == SKIPPED_SYMLINK:
-            # not a problem with the backup itself; the entry is still reported
+        if entry.get("skipped") == SKIPPED_SYMLINK:
+            # nothing was read, so nothing is known: not a problem with the backup itself
             continue
         if entry["class"] not in VERIFIABLE:
             return True

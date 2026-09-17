@@ -53,6 +53,8 @@ def _format_text(entries: list[dict]) -> str:
                 )
         if "wal" in entry:
             line += f"; wal: {entry['wal']}"
+        if "skipped" in entry:
+            line += f"; skipped: {entry['skipped']}"
         lines.append(_printable(line))
     return "".join(line + "\n" for line in lines)
 
