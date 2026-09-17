@@ -59,12 +59,20 @@ def _format_text(entries: list[dict]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    warnings: list[str] = []
     try:
-        entries = verify(args.dir) if args.command == "verify" else scan(args.dir)
+        if args.command == "verify":
+            entries = verify(args.dir, warnings)
+        else:
+            entries = scan(args.dir, warnings)
     except (AuditError, OSError) as exc:
         # OSError: e.g. no usable temporary directory exists at all
         print(f"sqlite-snapshot-audit: error: {exc}", file=sys.stderr)
         return EXIT_ERROR
+
+    for warning in warnings:
+        # stderr, so that the entries on stdout stay a plain list and byte-identical
+        print(f"sqlite-snapshot-audit: warning: {_printable(warning)}", file=sys.stderr)
 
     if args.json:
         sys.stdout.write(json.dumps(entries, indent=2) + "\n")

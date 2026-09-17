@@ -61,6 +61,11 @@ Walks the directory recursively and prints one entry per database unit or proble
   followed, and dangling symlinks are ignored. Symlinks to files are never followed (their target may lie
   outside the directory): each one is reported as a `skipped-symlink` entry and is neither checked nor grouped
   as a sidecar. A symlink is not a problem with the backup itself, so it does not make `verify` exit 1.
+- A path that cannot be read — an unreadable subdirectory such as a root-only `lost+found`, or a file whose
+  permissions deny it — is skipped with a `warning: skipped <path>: <error>` line on stderr, and the rest of
+  the tree is still audited. Only `<dir>` itself being unreadable is an error (exit 2). Warnings go to stderr,
+  so the entries on stdout stay a plain list; a caller that treats exit 0 as "restorable" should not discard
+  stderr.
 - Without `--json`, the same entries are printed one per line; bytes in file names that are not valid UTF-8
   are shown as `\xNN` escapes.
 
@@ -135,9 +140,9 @@ a non-SQLite `name.db` has a `name.db-wal`, both a `not-sqlite` and an `orphan-s
 
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
-| 0    | tree scanned                       | every `standalone`/`wal-family` entry has `integrity: "ok"` and no `invalid` `wal`, and there are no `orphan-sidecar`/`not-sqlite` entries (`skipped-symlink` entries are printed but do not affect the exit code) |
+| 0    | tree scanned (unreadable paths warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and no `invalid` `wal`, and there are no `orphan-sidecar`/`not-sqlite` entries (`skipped-symlink` entries are printed but do not affect the exit code) |
 | 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry, any integrity other than `ok`, or any `invalid` `wal` (all entries are still printed) |
-| 2    | usage or IO error (e.g. `<dir>` does not exist, unreadable file) | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
+| 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
 

@@ -3,6 +3,9 @@
 Nothing under the scanned directory is ever opened for writing: ``scan`` reads
 at most the first 16 bytes of each regular file (symlinks are reported, not followed), and ``verify`` only opens
 SQLite (and reads -wal headers) on copies placed in a temporary directory outside the scanned tree.
+
+Paths that cannot be read are collected in a ``warnings`` list and skipped, so one
+unreadable directory or file does not hide the rest of the tree.
 """
 
 from __future__ import annotations
@@ -51,25 +54,42 @@ def _is_sqlite(path: str) -> bool:
         return f.read(len(SQLITE_HEADER)) == SQLITE_HEADER
 
 
-def _walk_files(root: str) -> tuple[list[str], list[str]]:
+def _relative(root: str, path: str) -> str:
+    return os.path.relpath(path, root).replace(os.sep, "/")
+
+
+def _warning(root: str, path: str, exc: OSError) -> str:
+    return f"skipped {_relative(root, path)}: {exc.strerror or exc}"
+
+
+def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str]]:
     """Return (regular files, symlinks to files) under root, relative and "/"-separated.
 
     Symlinks are never followed: their targets may lie outside root.
+
+    A directory that cannot be read (a root-only ``lost+found``, say) is recorded in
+    ``warnings`` and skipped; the rest of the tree is still audited. Only root itself
+    being unreadable is fatal.
     """
 
-    def raise_error(err: OSError) -> None:
-        raise err
+    def on_error(err: OSError) -> None:
+        if err.filename is None or os.path.abspath(err.filename) == os.path.abspath(root):
+            raise err
+        warnings.append(_warning(root, err.filename, err))
 
     regular, symlinks = [], []
-    for dirpath, dirnames, filenames in os.walk(root, onerror=raise_error):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
         dirnames.sort()
-        for name in filenames:
+        for name in sorted(filenames):
             full = os.path.join(dirpath, name)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            rel = _relative(root, full)
             try:
                 st = os.lstat(full)
             except FileNotFoundError:
                 # the file vanished while walking
+                continue
+            except OSError as exc:
+                warnings.append(_warning(root, full, exc))
                 continue
             if stat.S_ISLNK(st.st_mode):
                 # dangling symlinks point at nothing and are ignored
@@ -83,26 +103,32 @@ def _walk_files(root: str) -> tuple[list[str], list[str]]:
     return sorted(regular), sorted(symlinks)
 
 
-def scan(root: str) -> list[dict]:
+def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
     """Classify every SQLite database, sidecar, would-be database and file symlink under root.
 
     Returns entries sorted by ``main`` (then ``class``); paths are relative to root.
-    Raises AuditError if root is not a directory or a file cannot be read.
+    Paths that cannot be read are appended to ``warnings`` and left out of the entries;
+    AuditError is raised only if root itself is not a readable directory.
     """
+    if warnings is None:
+        warnings = []
     if not os.path.isdir(root):
         raise AuditError(f"not a directory: {root}")
 
     try:
-        files, symlinks = _walk_files(root)
-        databases = set()
-        others = []
-        for rel in files:
-            if _is_sqlite(os.path.join(root, rel)):
-                databases.add(rel)
-            else:
-                others.append(rel)
+        files, symlinks = _walk_files(root, warnings)
     except OSError as exc:
         raise AuditError(str(exc)) from exc
+
+    databases = set()
+    others = []
+    for rel in files:
+        try:
+            is_database = _is_sqlite(os.path.join(root, rel))
+        except OSError as exc:
+            warnings.append(_warning(root, os.path.join(root, rel), exc))
+            continue
+        (databases.add if is_database else others.append)(rel)
 
     sidecars: dict[str, list[str]] = {}
     not_sqlite = []
@@ -143,7 +169,8 @@ def scan(root: str) -> list[dict]:
         try:
             empty = os.path.getsize(os.path.join(root, main)) == 0
         except OSError as exc:
-            raise AuditError(str(exc)) from exc
+            warnings.append(_warning(root, os.path.join(root, main), exc))
+            continue
         reason = "empty file" if empty else "database file name but no SQLite header"
         entries.append({"main": main, "sidecars": [], "class": NOT_SQLITE, "reason": reason})
 
@@ -324,7 +351,7 @@ def _inside(path: str, root: str) -> bool:
         return False
 
 
-def verify(root: str) -> list[dict]:
+def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
     """Scan root, then check a temporary copy of every standalone/wal-family unit.
 
     Verified entries gain ``integrity`` and ``tables`` keys; other entries are
@@ -332,7 +359,7 @@ def verify(root: str) -> list[dict]:
     reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``. Checked
     entries with a -wal sidecar also gain ``wal`` (see _check_wal).
     """
-    entries = scan(root)
+    entries = scan(root, warnings)
     if _inside(tempfile.gettempdir(), root):
         raise AuditError(
             f"temporary directory {tempfile.gettempdir()} is inside {root}; "

@@ -333,8 +333,8 @@ def test_source_file_vanishing_before_copy_is_a_backup_problem(tmp_path, monkeyp
     make_db(tmp_path / "a.db", rows=1)
     real_scan = audit.scan
 
-    def scan_then_delete(root):
-        entries = real_scan(root)
+    def scan_then_delete(root, warnings=None):
+        entries = real_scan(root, warnings)
         (tmp_path / "a.db").unlink()
         return entries
 
@@ -402,17 +402,82 @@ def test_usage_error_exits_2(capsys):
 @pytest.mark.skipif(
     not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable files"
 )
-def test_unreadable_file_exits_2(tmp_path, capsys):
+def test_unreadable_file_is_a_warning_and_the_rest_is_audited(tmp_path, capsys):
+    make_db(tmp_path / "a.db", rows=1)
     locked = tmp_path / "locked.db"
     make_db(locked, rows=1)
     locked.chmod(0)
     try:
+        warnings = []
+        entries = scan(str(tmp_path), warnings)
         code, out, err = run_cli(capsys, "verify", str(tmp_path), "--json")
     finally:
         locked.chmod(0o600)
+    assert [e["main"] for e in entries] == ["a.db"]
+    assert warnings == [f"skipped locked.db: {os.strerror(errno.EACCES)}"]
+    assert code == 0
+    assert [e["main"] for e in json.loads(out)] == ["a.db"]
+    assert err == (
+        "sqlite-snapshot-audit: warning: skipped locked.db: "
+        f"{os.strerror(errno.EACCES)}\n"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable directories"
+)
+def test_unreadable_subdirectory_is_a_warning_and_the_rest_is_audited(tmp_path, capsys):
+    """A backup volume mounted at a filesystem root has a root-only lost+found."""
+    make_db(tmp_path / "a.db", rows=1)
+    (tmp_path / "sub").mkdir()
+    make_db(tmp_path / "sub" / "b.db", rows=1)
+    locked = tmp_path / "lost+found"
+    locked.mkdir()
+    make_db(locked / "hidden.db", rows=1)
+    locked.chmod(0)
+    try:
+        code, out, err = run_cli(capsys, "verify", str(tmp_path), "--json")
+    finally:
+        locked.chmod(0o700)
+    assert code == 0
+    assert [e["main"] for e in json.loads(out)] == ["a.db", "sub/b.db"]
+    assert err == (
+        "sqlite-snapshot-audit: warning: skipped lost+found: "
+        f"{os.strerror(errno.EACCES)}\n"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable directories"
+)
+@pytest.mark.parametrize("command", ["scan", "verify"])
+def test_unreadable_audited_directory_itself_exits_2(tmp_path, capsys, command):
+    root = tmp_path / "root"
+    root.mkdir()
+    make_db(root / "a.db", rows=1)
+    root.chmod(0)
+    try:
+        code, out, err = run_cli(capsys, command, str(root), "--json")
+    finally:
+        root.chmod(0o700)
     assert code == 2
     assert out == ""
     assert "Permission denied" in err
+
+
+def test_file_that_vanishes_during_the_walk_is_not_a_warning(tmp_path, monkeypatch):
+    make_db(tmp_path / "a.db", rows=1)
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if str(path).endswith("a.db"):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(audit.os, "lstat", lstat)
+    warnings = []
+    assert scan(str(tmp_path), warnings) == []
+    assert warnings == []
 
 
 def test_sidecar_next_to_non_sqlite_main_and_shm_without_wal(tmp_path):
