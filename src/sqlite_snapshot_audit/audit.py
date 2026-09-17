@@ -202,9 +202,13 @@ def _check_copy(db_path: str) -> tuple[str, dict]:
     return integrity, tables
 
 
-def _wal_checksum(data: bytes, big_endian: bool) -> tuple[int, int]:
-    """SQLite's WAL checksum (walChecksumBytes) over data, whose length is a multiple of 8."""
-    s1 = s2 = 0
+def _wal_checksum(data: bytes, big_endian: bool, seed: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    """SQLite's WAL checksum (walChecksumBytes) over data, whose length is a multiple of 8.
+
+    ``seed`` continues a running checksum: frames are checksummed in order, each one
+    starting from the previous frame's result (the header's checksum seeds frame 1).
+    """
+    s1, s2 = seed
     words = struct.unpack((">" if big_endian else "<") + f"{len(data) // 4}I", data)
     for i in range(0, len(words), 2):
         s1 = (s1 + words[i] + s2) & 0xFFFFFFFF
@@ -222,12 +226,16 @@ def _database_page_size(db_path: str) -> int | None:
 
 
 def _check_wal(wal_path: str, db_path: str) -> str:
-    """Check a (copied) -wal file against its database, which SQLite does not do.
+    """Check a (copied) -wal file the way SQLite's recovery reads it, which it does not report.
 
-    SQLite silently ignores a -wal with a bad header, so integrity_check says "ok" for a
-    database whose uncheckpointed transactions were lost. Returns "empty",
-    "ok (<N> frames)" or "invalid: <reason>"; N counts the complete frames, from the
-    first, that carry the header's salt (later frames are left over and ignored by SQLite).
+    SQLite silently ignores a -wal it cannot replay, so integrity_check says "ok" for a
+    database whose uncheckpointed transactions were lost. This repeats the checks of
+    walIndexRecover(): header, then each frame's salt and its link in the running
+    checksum chain, and only up to the last commit frame is replayed.
+
+    Returns "empty", "ok (<N> frames)" with N the number of frames SQLite would replay,
+    or "invalid: <reason>" when the header is unusable or frames are present that would
+    be dropped.
     """
     wal_size = os.path.getsize(wal_path)
     if wal_size == 0:
@@ -246,17 +254,44 @@ def _check_wal(wal_path: str, db_path: str) -> str:
         db_page_size = _database_page_size(db_path)
         if page_size != db_page_size:
             return f"invalid: page size {page_size} does not match database page size {db_page_size}"
+        big_endian = magic == WAL_MAGIC_BIG_ENDIAN
         frame_size = WAL_FRAME_HEADER_SIZE + page_size
-        frames = 0
-        while WAL_HEADER_SIZE + (frames + 1) * frame_size <= wal_size:
-            f.seek(WAL_HEADER_SIZE + frames * frame_size)
-            frame_salts = struct.unpack(">2I", f.read(WAL_FRAME_HEADER_SIZE)[8:16])
-            if frame_salts != (salt1, salt2):
-                if frames == 0:
-                    return "invalid: first frame salt does not match header salt"
+        checksum = (cksum1, cksum2)
+        good = 0  # frames that decode; SQLite stops reading at the first one that does not
+        replayed = 0  # SQLite's mxFrame: frames up to and including the last commit frame
+        broken = None  # (number of frames present, why the next frame is not usable)
+        f.seek(WAL_HEADER_SIZE)
+        while f.tell() < wal_size:
+            frame, number = f.read(frame_size), good + 1
+            if len(frame) < frame_size:
+                broken = (number, f"frame {number} stops after {len(frame)} of {frame_size} bytes")
                 break
-            frames += 1
-    return f"ok ({frames} frames)"
+            page_number, truncate, fsalt1, fsalt2, fcksum1, fcksum2 = struct.unpack(
+                ">6I", frame[:WAL_FRAME_HEADER_SIZE]
+            )
+            if (fsalt1, fsalt2) != (salt1, salt2):
+                if good == 0:
+                    return "invalid: first frame salt does not match header salt"
+                # left over from an earlier WAL generation; SQLite stops here and so do we
+                break
+            checksum = _wal_checksum(frame[:8], big_endian, checksum)
+            checksum = _wal_checksum(frame[WAL_FRAME_HEADER_SIZE:], big_endian, checksum)
+            if (fcksum1, fcksum2) != checksum:
+                broken = (number, f"frame {number} fails its checksum")
+                break
+            if page_number == 0:
+                broken = (number, f"frame {number} has page number 0")
+                break
+            good = number
+            if truncate:
+                replayed = good
+    if broken is not None:
+        present, reason = broken
+    elif replayed < good:
+        present, reason = good, "the last transaction has no commit frame"
+    else:
+        return f"ok ({replayed} frames)"
+    return f"invalid: {replayed} of {present} frames will be replayed ({reason})"
 
 
 def _copy_file(src_path: str, dst_path: str) -> None:

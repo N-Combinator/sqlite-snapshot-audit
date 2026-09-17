@@ -97,19 +97,22 @@ fails on the tool's side — the temporary directory is missing, full (`ENOSPC`)
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
 `verify` exits 2.
 
-Entries whose unit includes a `-wal` sidecar also gain a `wal` key. SQLite silently ignores a `-wal` file
-with a bad header — the database then passes `integrity_check` while every transaction in the `-wal` is
-lost — so `verify` reads the header of the copied `-wal` itself:
+Entries whose unit includes a `-wal` sidecar also gain a `wal` key. SQLite silently ignores `-wal` content it
+cannot replay — the database then passes `integrity_check` while the transactions in the `-wal` are lost — so
+`verify` reads the copied `-wal` itself, repeating the checks SQLite's recovery makes: the header, then each
+frame's salt and its link in the running checksum chain, up to the last commit frame:
 
 | `wal`                   | meaning                                                                                    |
 |-------------------------|--------------------------------------------------------------------------------------------|
 | `"empty"`               | the `-wal` is 0 bytes (nothing to replay)                                                  |
-| `"ok (<N> frames)"`     | valid header; `N` is the number of complete frames, from the first, carrying the header's salt (frames after them are left over from an earlier WAL generation and ignored by SQLite) |
-| `"invalid: <reason>"`   | the header is truncated, has a wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), fails its checksum, declares a page size different from the database's (header bytes 16–17), or the first frame's salt differs from the header's |
+| `"ok (<N> frames)"`     | `N` is the number of frames SQLite would replay (up to the last commit frame); frames after them carry an older WAL generation's salt and are ignored by SQLite, as they are here |
+| `"invalid: <reason>"`   | the header is unusable — truncated, wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), failing checksum, a page size different from the database's (header bytes 16–17), or a first frame whose salt differs from the header's |
+| `"invalid: <N> of <M> frames will be replayed (<reason>)"` | the header is fine but frames of this WAL generation would be dropped: a frame fails its checksum (altered or torn page), the file stops in the middle of a frame, or the last transaction has no commit frame |
 
-An `invalid` `wal` makes `verify` exit 1 even when `integrity` is `ok`. These checks catch garbage, truncated
-and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different* database with the same
-page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would replay it.
+An `invalid` `wal` makes `verify` exit 1 even when `integrity` is `ok`. These checks catch garbage, truncated,
+damaged, half-written and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different*
+database with the same page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would
+replay it.
 
 A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
 of `null`. `orphan-sidecar`, `not-sqlite` and `skipped-symlink` entries are reported unchanged, without

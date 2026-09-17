@@ -630,14 +630,30 @@ def live_wal_copy(src_dir, dst_dir, name="app.db", page_size=None, rows=LIVE_ROW
     return dst_dir / name, dst_dir / f"{name}-wal"
 
 
-def reference_wal_checksum(data, big_endian):
+def reference_wal_checksum(data, big_endian, seed=bytes(8)):
     """walChecksumBytes from SQLite's wal.c, written independently of the code under test."""
-    s1 = s2 = 0
+    s1 = int.from_bytes(seed[:4], "big")
+    s2 = int.from_bytes(seed[4:], "big")
     order = "big" if big_endian else "little"
     for i in range(0, len(data), 8):
         s1 = (s1 + int.from_bytes(data[i : i + 4], order) + s2) % 2**32
         s2 = (s2 + int.from_bytes(data[i + 4 : i + 8], order) + s1) % 2**32
     return s1.to_bytes(4, "big") + s2.to_bytes(4, "big")
+
+
+def rewrite_wal_frame_checksums(wal, page_size=4096):
+    """Recompute the whole frame checksum chain, as SQLite would have written it."""
+    data = bytearray(wal.read_bytes())
+    big_endian = int.from_bytes(data[0:4], "big") & 1
+    running = bytes(data[24:32])  # the header checksum seeds the chain
+    frame_size = 24 + page_size
+    offset = 32
+    while offset + frame_size <= len(data):
+        payload = bytes(data[offset : offset + 8]) + bytes(data[offset + 24 : offset + frame_size])
+        running = reference_wal_checksum(payload, big_endian, running)
+        data[offset + 16 : offset + 24] = running
+        offset += frame_size
+    wal.write_bytes(bytes(data))
 
 
 def rewrite_wal_header(wal, magic=None, version=None, page_size=None, salts=None):
@@ -653,6 +669,29 @@ def rewrite_wal_header(wal, magic=None, version=None, page_size=None, salts=None
     wal.write_bytes(bytes(data))
 
 
+def wal_frames(wal, page_size=4096):
+    return (wal.stat().st_size - 32) // (24 + page_size)
+
+
+def sqlite_replay_count(main_path, wal):
+    """How many frames SQLite really replays: mxFrame of the wal-index header it rebuilds.
+
+    Works on a throw-away copy so the tree under test keeps its files.
+    """
+    scratch = tempfile.mkdtemp()
+    copy = Path(scratch) / "oracle.db"
+    shutil.copyfile(main_path, copy)
+    shutil.copyfile(wal, str(copy) + "-wal")
+    conn = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        index_header = Path(str(copy) + "-shm").read_bytes()  # deleted when the last user closes
+    finally:
+        conn.close()
+        shutil.rmtree(scratch)
+    return int.from_bytes(index_header[16:20], sys.byteorder)
+
+
 def verify_wal(capsys, root):
     code, out, _ = run_cli(capsys, "verify", str(root), "--json")
     (entry,) = json.loads(out)
@@ -661,12 +700,79 @@ def verify_wal(capsys, root):
 
 def test_valid_wal_is_ok_with_frame_count(tmp_path, capsys):
     main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
-    frames = (wal.stat().st_size - 32) // (24 + 4096)
+    frames = wal_frames(wal)
     assert frames >= 1
+    # the reported count is what SQLite replays, not just what the file holds
+    assert sqlite_replay_count(main_path, wal) == frames
     code, entry = verify_wal(capsys, tmp_path / "tree")
     assert code == 0
     assert entry["wal"] == f"ok ({frames} frames)"
     assert entry["tables"] == {"events": LIVE_ROWS_IN_WAL}
+
+
+def test_wal_frame_with_altered_page_is_invalid(tmp_path, capsys):
+    """One flipped byte in a frame's page breaks the checksum chain: SQLite replays nothing."""
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    data = bytearray(wal.read_bytes())
+    data[32 + 24 + 100] ^= 0x01  # page data of frame 1
+    wal.write_bytes(bytes(data))
+    assert sqlite_replay_count(main_path, wal) == 0
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == "invalid: 0 of 1 frames will be replayed (frame 1 fails its checksum)"
+    assert entry["integrity"] == "ok"  # the database alone is fine; the WAL rows are gone
+    assert entry["tables"] == {"events": 0}
+    assert code == 1
+
+
+def test_wal_cut_short_inside_a_frame_is_invalid(tmp_path, capsys):
+    """A -wal copied while it was being written ends mid-frame; SQLite drops that frame."""
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    frames = wal_frames(wal)
+    wal.write_bytes(wal.read_bytes()[:-10])
+    assert sqlite_replay_count(main_path, wal) == 0
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["wal"] == (
+        f"invalid: 0 of {frames} frames will be replayed "
+        f"(frame {frames} stops after {24 + 4096 - 10} of {24 + 4096} bytes)"
+    )
+    assert entry["tables"] == {"events": 0}
+    assert code == 1
+
+
+def test_wal_without_a_final_commit_frame_is_invalid(tmp_path, capsys):
+    """Frames after the last commit frame are complete and checksummed, but never replayed."""
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("committed",)] * 25)
+        conn.commit()
+        committed_frames = wal_frames(Path(str(src / "app.db") + "-wal"))
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("in flight",)] * 500)
+        conn.commit()
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        # drop the second transaction's commit frame, keeping its earlier frames intact
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+        wal.write_bytes(wal.read_bytes()[: -(24 + 4096)])
+    finally:
+        conn.close()
+    frames = wal_frames(wal)
+    assert frames > committed_frames
+    assert sqlite_replay_count(tree / "app.db", wal) == committed_frames
+    code, entry = verify_wal(capsys, tree)
+    assert entry["wal"] == (
+        f"invalid: {committed_frames} of {frames} frames will be replayed "
+        "(the last transaction has no commit frame)"
+    )
+    assert entry["tables"] == {"events": 25}
+    assert code == 1
 
 
 def test_wal_of_random_bytes_is_invalid(tmp_path, capsys):
@@ -749,6 +855,7 @@ def test_wal_header_checksum_is_checked(tmp_path, capsys):
 def test_big_endian_wal_checksum(tmp_path):
     main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
     rewrite_wal_header(wal, magic=0x377F0683)
+    rewrite_wal_frame_checksums(wal)  # the frame chain uses the magic's byte order too
     assert audit._check_wal(str(wal), str(main_path)).startswith("ok (")
     data = bytearray(wal.read_bytes())
     data[0:4] = (0x377F0682).to_bytes(4, "big")  # same checksum read as little-endian
