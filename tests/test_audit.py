@@ -806,6 +806,29 @@ def wal_frames(wal, page_size=4096):
     return (wal.stat().st_size - 32) // (24 + page_size)
 
 
+def wal_generation(wal, page_size=4096):
+    """(frame number, commit or not) of the -wal frames that carry its header's salts.
+
+    Frames past those belong to an earlier generation (the file was reused after a
+    checkpoint-restart): they were checkpointed into the database long ago.
+    """
+    data = wal.read_bytes()
+    salts, frame_size, frames = data[16:24], 24 + page_size, []
+    for number in range(1, (len(data) - 32) // frame_size + 1):
+        head = data[32 + (number - 1) * frame_size :][:24]
+        if head[8:16] != salts:
+            break
+        frames.append((number, head[4:8] != bytes(4)))
+    return frames
+
+
+def break_wal_frame(wal, number, page_size=4096):
+    """Flip one byte of a frame's page, so its checksum -- and the chain after it -- fails."""
+    data = bytearray(wal.read_bytes())
+    data[32 + (number - 1) * (24 + page_size) + 24 + 100] ^= 0x01
+    wal.write_bytes(bytes(data))
+
+
 def sqlite_replay_count(main_path, wal):
     """How many frames SQLite really replays: mxFrame of the wal-index header it rebuilds.
 
@@ -947,6 +970,125 @@ def test_wal_with_a_torn_tail_after_a_commit_is_ok(tmp_path, capsys):
     assert entry["integrity"] == "ok"
     assert entry["tables"] == {"events": 25}
     assert code == 0
+
+
+def test_dropped_frames_after_a_broken_one_are_all_counted(tmp_path, capsys):
+    """The count of dropped frames covers the whole tail, not just the frame that broke."""
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("PRAGMA cache_size=10")  # so an open transaction spills to the -wal
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("committed",)] * 25)
+        conn.commit()
+        committed_frames = wal_frames(Path(str(src / "app.db") + "-wal"))
+        conn.execute("BEGIN")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("in flight " * 40,)] * 2000)
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+        conn.rollback()
+    finally:
+        conn.close()
+    broken = committed_frames + 2  # inside the uncommitted tail, far from its end
+    frames = len(wal_generation(wal))
+    assert frames > broken + 10
+    break_wal_frame(wal, broken)
+    assert sqlite_replay_count(tree / "app.db", wal) == committed_frames
+    code, entry = verify_wal(capsys, tree)
+    # every frame from the break on is discarded, so all of them are reported as dropped
+    assert entry["wal"] == (
+        f"ok ({committed_frames} frames; {frames - committed_frames} further frames will be "
+        f"dropped, as SQLite does: frame {broken} fails its checksum)"
+    )
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": 25}
+    assert code == 0
+
+
+def test_wal_that_drops_a_committed_transaction_is_invalid(tmp_path, capsys):
+    """A break in the middle of committed frames loses whole transactions, not a torn tail."""
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for _ in range(3):  # three transactions, each spanning several frames
+            conn.executemany("INSERT INTO events (body) VALUES (?)", [("x" * 200,)] * 30)
+            conn.commit()
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+    finally:
+        conn.close()
+    generation = wal_generation(wal)
+    commits = [number for number, commit in generation if commit]
+    assert len(commits) == 3
+    broken = commits[0] + 1  # the first frame of the second transaction
+    assert broken < commits[1]
+    break_wal_frame(wal, broken)
+    assert sqlite_replay_count(tree / "app.db", wal) == commits[0]
+    code, entry = verify_wal(capsys, tree)
+    assert entry["wal"] == (
+        f"invalid: {commits[0]} of {len(generation)} frames will be replayed "
+        f"(frame {broken} fails its checksum; dropped frame {commits[1]} is a commit frame, "
+        "so a committed transaction is lost)"
+    )
+    # SQLite says the database is fine and quietly restores one transaction out of three
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": 30}
+    assert code == 1
+
+
+def test_frames_of_an_earlier_wal_generation_are_not_counted_as_dropped(tmp_path, capsys):
+    """After a checkpoint-restart the file keeps older frames; they hold nothing to lose."""
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("x" * 200,)] * 400)
+        conn.commit()
+        # the restart rewinds to frame 1 with new salts and leaves the old frames in the file
+        conn.execute("PRAGMA wal_checkpoint(RESTART)")
+        for _ in range(2):
+            conn.executemany("INSERT INTO events (body) VALUES (?)", [("y" * 200,)] * 30)
+            conn.commit()
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+    finally:
+        conn.close()
+    generation = wal_generation(wal)
+    commits = [number for number, commit in generation if commit]
+    assert len(commits) == 2
+    assert wal_frames(wal) > len(generation)  # the file is longer than the current generation
+    broken = commits[0] + 1
+    assert broken < commits[1]
+    break_wal_frame(wal, broken)
+    assert sqlite_replay_count(tree / "app.db", wal) == commits[0]
+    code, entry = verify_wal(capsys, tree)
+    assert entry["wal"] == (
+        f"invalid: {commits[0]} of {len(generation)} frames will be replayed "
+        f"(frame {broken} fails its checksum; dropped frame {commits[1]} is a commit frame, "
+        "so a committed transaction is lost)"
+    )
+    assert code == 1
 
 
 def test_wal_of_random_bytes_is_invalid(tmp_path, capsys):

@@ -283,6 +283,37 @@ def _database_page_size(db_path: str) -> int | None:
     return 65536 if size == 1 else size
 
 
+def _wal_generation_tail(f, first: int, frame_size: int, salts: bytes) -> tuple[int, int | None]:
+    """Count the frames of this WAL generation from frame ``first`` on, commit frames included.
+
+    SQLite stops reading at ``first``, but the file usually goes on, and everything from
+    there is what a restore loses -- so the loss has to be measured over the rest of the
+    file, not over the one frame that broke the chain. Frames carrying an earlier
+    generation's salts are not counted: they were checkpointed into the database long ago
+    and hold nothing. Frame ``first`` itself is counted without re-checking its salts; the
+    caller has already decided it belongs to this generation.
+
+    Returns (frames present from ``first`` on, number of the first complete frame among
+    them that commits a transaction, or None). A frame the file cuts short counts as
+    present but never as a commit: a transaction whose last frame is torn was never
+    durable, which is the ordinary state of a copy taken from a live database.
+    """
+    count, commit = 0, None
+    f.seek(WAL_HEADER_SIZE + (first - 1) * frame_size)
+    while True:
+        frame = f.read(frame_size)
+        if not frame:
+            break
+        if count and len(frame) >= WAL_FRAME_HEADER_SIZE and frame[8:16] != salts:
+            break
+        count += 1
+        if len(frame) < frame_size:
+            break
+        if commit is None and frame[4:8] != b"\0\0\0\0":
+            commit = first + count - 1
+    return count, commit
+
+
 def _check_wal(wal_path: str, db_path: str) -> str:
     """Check a (copied) -wal file the way SQLite's recovery reads it, which it does not report.
 
@@ -294,7 +325,9 @@ def _check_wal(wal_path: str, db_path: str) -> str:
     Returns "empty", "ok (<N> frames)" with N the number of frames SQLite would replay,
     or "invalid: <reason>" when SQLite would replay nothing at all. Frames past the last
     commit frame (the torn or uncommitted tail every copy of a live WAL database has) are
-    reported in the "ok" value: dropping them is SQLite's crash recovery, not data loss.
+    reported in the "ok" value: dropping them is SQLite's crash recovery, not data loss --
+    unless one of the dropped frames is itself a commit frame, in which case a transaction
+    that was fully written is being thrown away and the -wal is reported as invalid.
     """
     wal_size = os.path.getsize(wal_path)
     if wal_size == 0:
@@ -318,7 +351,7 @@ def _check_wal(wal_path: str, db_path: str) -> str:
         checksum = (cksum1, cksum2)
         good = 0  # frames that decode; SQLite stops reading at the first one that does not
         replayed = 0  # SQLite's mxFrame: frames up to and including the last commit frame
-        broken = None  # (number of frames present, why the next frame is not usable)
+        broken = None  # (number of the first unusable frame, why it is not usable)
         f.seek(WAL_HEADER_SIZE)
         while f.tell() < wal_size:
             frame, number = f.read(frame_size), good + 1
@@ -344,19 +377,28 @@ def _check_wal(wal_path: str, db_path: str) -> str:
             good = number
             if truncate:
                 replayed = good
-    if broken is not None:
-        present, reason = broken
-        dropped_because = reason
-    elif replayed < good:
-        present = good
-        reason = "the last transaction has no commit frame"
-        dropped_because = "they were never committed"
-    else:
-        return f"ok ({replayed} frames)"
+        if broken is not None:
+            number, reason = broken
+            # the frames after the break are dropped too, and they are usually the bulk of it
+            tail, commit = _wal_generation_tail(f, number, frame_size, header[16:24])
+            present, dropped_because = number - 1 + tail, reason
+        elif replayed < good:
+            present, commit = good, None
+            reason = "the last transaction has no commit frame"
+            dropped_because = "they were never committed"
+        else:
+            return f"ok ({replayed} frames)"
     if replayed == 0:
         # nothing is replayed: everything the -wal holds is lost and the copy is only
         # the main file, which is what makes this worth failing on
         return f"invalid: 0 of {present} frames will be replayed ({reason})"
+    if commit is not None:
+        # the dropped frames are not the uncommitted tail of a live copy: one of them
+        # commits, so a transaction that was written in full does not survive the restore
+        return (
+            f"invalid: {replayed} of {present} frames will be replayed ({reason}; "
+            f"dropped frame {commit} is a commit frame, so a committed transaction is lost)"
+        )
     # A prefix up to the last commit frame is replayed and the rest is discarded, which
     # is exactly what SQLite does after a crash; no committed transaction is lost.
     return (

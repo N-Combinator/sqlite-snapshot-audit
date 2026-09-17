@@ -117,17 +117,22 @@ frame's salt and its link in the running checksum chain, up to the last commit f
 | `"ok (<N> frames; <M> further frames will be dropped, as SQLite does: <reason>)"` | the `-wal` ends after its last commit frame in a tail SQLite discards on recovery — an uncommitted transaction, a frame the copy caught half-written, or a frame whose checksum does not chain. Normal for any `cp`/rsync of a live WAL database: the `N` replayed frames hold every committed transaction, so this is **not** a failure |
 | `"invalid: <reason>"`   | the header is unusable, so SQLite throws the whole `-wal` away — truncated, wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), failing checksum, a page size different from the database’s (header bytes 16–17), or a first frame whose salt differs from the header’s |
 | `"invalid: 0 of <M> frames will be replayed (<reason>)"` | the header is fine but not one frame is replayed — the `-wal` holds frames and every one of them is lost, leaving only the main file |
+| `"invalid: <N> of <M> frames will be replayed (<reason>; dropped frame <K> is a commit frame, so a committed transaction is lost)"` | the dropped frames are not an uncommitted tail: frame `K` past the break commits a transaction that was written in full, so the restore silently loses it (and everything committed after it) |
+
+`M` counts the frames the `-wal` really holds, from the first one to the last of its generation — not just the
+frames up to the break. A frame the file cuts short counts as one; frames carrying an older generation’s salts
+do not count at all, as they were checkpointed into the database long ago.
 | `"symlink-skipped"`     | a sidecar of the unit is a symbolic link: it is not followed, so the unit could not be copied as it stands and what its `-wal` holds is unknown |
 
 An `invalid` or `symlink-skipped` `wal` makes `verify` exit 1 even when `integrity` is `ok`; an `ok` one never
-does, however many frames its tail drops — discarding everything past the last commit frame *is* SQLite’s
-crash recovery, and no transaction that was ever reported committed is lost. The frame accounting is reported
-either way, so a caller that wants to know how much of a `-wal` survived the copy can read it. These checks
-catch garbage, truncated, damaged, half-written and mismatched `-wal` files, but not a complete,
-self-consistent `-wal` of a *different* database with the same page size: nothing in the WAL format ties a
-`-wal` to its database, and SQLite would replay it. They also cannot tell a never-committed tail from one
-corrupted after the fact: once the checksum chain breaks, nothing beyond it can be read, so a `-wal` damaged
-past its last commit frame is reported as a dropped tail.
+does, however many frames its tail drops — discarding an uncommitted tail *is* SQLite’s crash recovery, and no
+transaction that was ever reported committed is lost. The frame accounting is reported either way, so a caller
+that wants to know how much of a `-wal` survived the copy can read it. These checks catch garbage, truncated,
+damaged, half-written and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different*
+database with the same page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would
+replay it. Past a broken checksum the frames can only be read as bytes, not verified, so a dropped tail of
+frames that none of them commits is taken at face value: a `-wal` corrupted inside a transaction that was
+never committed is reported as the ordinary tail of a live copy.
 
 A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
 of `null`. `orphan-sidecar`, `not-sqlite` and `skipped-symlink` entries are reported unchanged, without
@@ -151,7 +156,7 @@ file named exactly `-wal` or `-shm` has no main file name in front of the suffix
 
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
-| 0    | tree scanned (unreadable paths warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped tail), and there are no `orphan-sidecar`/`not-sqlite` entries (`skipped-symlink` entries are printed but do not affect the exit code) |
+| 0    | tree scanned (unreadable paths warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries (`skipped-symlink` entries are printed but do not affect the exit code) |
 | 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry, any integrity other than `ok`, or any `invalid`/`symlink-skipped` `wal` (all entries are still printed) |
 | 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
