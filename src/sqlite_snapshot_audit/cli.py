@@ -29,6 +29,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _printable(text: str) -> str:
+    """Show undecodable file-name bytes (surrogate escapes) as ``\\xNN`` instead of failing."""
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    except UnicodeEncodeError:
+        # a lone surrogate that is not an escaped byte
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _format_text(entries: list[dict]) -> str:
     lines = []
     for entry in entries:
@@ -42,7 +51,7 @@ def _format_text(entries: list[dict]) -> str:
                 line += "; tables: " + ", ".join(
                     f"{name}={count}" for name, count in entry["tables"].items()
                 )
-        lines.append(line)
+        lines.append(_printable(line))
     return "".join(line + "\n" for line in lines)
 
 
@@ -58,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         sys.stdout.write(json.dumps(entries, indent=2) + "\n")
     else:
+        if hasattr(sys.stdout, "reconfigure"):
+            # a non-UTF-8 terminal encoding must not turn names into a traceback
+            sys.stdout.reconfigure(errors="backslashreplace")
         sys.stdout.write(_format_text(entries))
 
     if args.command == "verify" and has_problems(entries):

@@ -412,6 +412,34 @@ def test_non_utf8_file_name(tmp_path, capsys):
     assert entry["main"] == name
     assert entry["tables"] == {"items": 1}
 
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path))
+    assert code == 0
+    assert out == (
+        "standalone      caf\\xe9.db - SQLite database without -wal/-shm sidecars; "
+        "integrity: ok; tables: items=1\n"
+    )
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "ascii"])
+def test_text_output_never_crashes_on_file_names(tmp_path, encoding):
+    try:
+        make_db(tmp_path / os.fsdecode(b"caf\xe9.db"), rows=1)
+    except (OSError, UnicodeEncodeError, sqlite3.Error):
+        pytest.skip("file system does not accept non-UTF-8 names")
+    make_db(tmp_path / "na\u00efve.db", rows=1)
+    env = dict(os.environ, PYTHONPATH=str(SRC), PYTHONIOENCODING=encoding)
+    for command in ("scan", "verify"):
+        result = subprocess.run(
+            [sys.executable, "-m", "sqlite_snapshot_audit", command, str(tmp_path)],
+            capture_output=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == b""
+        assert b"caf\\xe9.db" in result.stdout
+        expected = "na\u00efve.db" if encoding == "utf-8" else "na\\xefve.db"
+        assert expected.encode(encoding) in result.stdout
+
 
 def test_module_entry_point_exit_codes(tree, tmp_path):
     env = dict(os.environ, PYTHONPATH=str(SRC))
