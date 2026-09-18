@@ -8,6 +8,8 @@ integrity-checks a temporary copy of each database unit.
 
 The audited tree is never modified: `scan` reads at most the first 16 bytes of each file, and `verify` opens
 SQLite only on copies in a temporary directory outside the tree (it refuses to run if `TMPDIR` points inside it).
+Symbolic links are followed only as far as the tree itself: one resolving inside `<dir>` is an ordinary file
+here, one leaving it or leading nowhere is reported instead of read.
 
 Requires Python 3.10+; no runtime dependencies beyond the standard library.
 
@@ -57,22 +59,27 @@ Walks the directory recursively and prints one entry per database unit or proble
 - Databases are detected by the 16-byte header `SQLite format 3\0`, whatever their extension.
 - Paths are relative to the scanned directory, `/`-separated. The list is sorted by `main` (then `class`) and
   contains no timestamps or hostnames, so two runs over the same tree produce byte-identical output.
-- Only regular files are read: FIFOs, sockets and devices are skipped. Symlinks are never followed, because
-  their target may lie outside the directory, but they are always reported — a link is classified from
-  `lstat` alone, so a **broken link counts exactly like a working one** and never drops out of the listing:
-  - a **symlinked directory** is not descended into, and each one is reported on stderr as
-    `warning: symlinked directory not followed: <path>` — whatever it holds is not part of the audit;
-  - a symlink named `<name>-wal` or `<name>-shm` is still grouped with its database by name (otherwise the
+- Only regular files are read: FIFOs, sockets and devices are skipped.
+- **Symbolic links** are followed exactly as far as the audited tree goes:
+  - a link resolving to a regular file **inside `<dir>`** is an ordinary file here: it is read, classified by
+    its header, grouped into a family and verified like the file it points at — what it points at is part of
+    the tree that would be restored. (A backup laid out as `store/app.db` plus a `current.db` link therefore
+    audits cleanly, and a whole `current.db` + `current.db-wal` unit is verified through its links.)
+  - a link whose target lies **outside `<dir>`**, or that **does not resolve**, is not followed: its target is
+    not part of what would be restored, and reading it could reach anywhere on the host. It is still reported,
+    with `"skipped": "symlink-outside"` or `"skipped": "symlink-dangling"` saying which, plus a
+    `warning: symbolic link not followed: <path> (<why>)` line on stderr. Its `class` is `not-sqlite`, because
+    no header was read to classify it — the `skipped` key, not the class, says why.
+  - such a link named `<name>-wal` or `<name>-shm` is grouped with its database by name anyway (otherwise the
     database would look `standalone` and be verified without its WAL); the link is named in the entry's
-    `reason` and the unit fails `verify` (see `wal: symlink-skipped` below). This holds for a dangling `-wal`
-    too — a `-wal` that arrived as a link to a path that does not exist on this host is the case where
-    dropping it would be most expensive, since the rows it holds are in no other file;
-  - every other **file symlink** gets an entry of its own with `"skipped": "symlink"`. Its `class` is
-    `not-sqlite`, because no header was read to classify it — the `skipped` key, not the class, says why.
-    Nothing was opened, so nothing about the target is established, and `verify` exits 1 like it does for any
-    other `not-sqlite` entry.
-  - a link whose target is missing says so in its `reason` (`dangling symbolic link (target is missing)`, or
-    `<name> (dangling)` in the list of a unit's unfollowed sidecars).
+    `reason`, and for a `-wal` the unit fails `verify` (`wal: symlink-outside` / `symlink-dangling` below).
+    This holds for a dangling `-wal` too — a `-wal` that arrived as a link to a path that does not exist on
+    this host is the case where dropping it would be most expensive, since the rows it holds are in no other
+    file. A `-shm` in the same state does **not** fail the unit: see `shm` below.
+  - a **symlinked directory** is not descended into (a link back up the tree would loop forever), and each one
+    is reported on stderr as `warning: symlinked directory not followed: <path>`. If its target is inside
+    `<dir>`, the warning says so and nothing is missing from the audit — those files are walked under their
+    real path. If it leads outside, whatever it holds is not part of the audit.
 - A path that cannot be read — an unreadable subdirectory such as a root-only `lost+found`, or a file whose
   permissions deny it — is skipped with a `warning: skipped <path>: <error>` line on stderr, and the rest of
   the tree is still audited. Sidecars are the exception: they are grouped with their database **by name**,
@@ -80,8 +87,14 @@ Walks the directory recursively and prints one entry per database unit or proble
   unit stays `wal-family` and `verify` reports `wal: "unreadable: <path>: <error>"` and exits 1 instead of
   passing the database with a row count taken from the main file alone. A main file that cannot be read and
   has a sidecar is reported as `orphan-sidecar` (`main file could not be read: <error>`). Only `<dir>` itself
-  being unreadable is an error (exit 2). Warnings go to stderr, so the entries on stdout stay a plain list; a
-  caller that treats exit 0 as "restorable" should not discard stderr.
+  being unreadable is an error (exit 2).
+- Anything that was **not** audited — an unreadable file or directory, a link that was not followed, a
+  symlinked directory leading out of the tree — is counted, and the count is printed last on stderr:
+  `N path(s) could not be audited (unreadable, or a symbolic link that was not followed); the tree was not
+  audited in full`. `verify` exits 1 when that count is not zero, because "nothing wrong was found in what I
+  could read" is not the same claim as "this tree was checked". Unreadable `-shm` sidecars are the one
+  exception (they hold no data; see below). Warnings and the count go to stderr, so the entries on stdout stay
+  a plain list.
 - Without `--json`, the same entries are printed one per line; bytes in file names that are not valid UTF-8
   are shown as `\xNN` escapes.
 
@@ -114,7 +127,8 @@ Those entries gain two keys:
 `integrity` is `"ok"`, the first row returned by `PRAGMA integrity_check`, or the error text if SQLite could
 not open or check the copy (e.g. `"database disk image is malformed"`). If the main file cannot be read
 from the audited tree (e.g. it vanished after the scan), `integrity` is `"copy failed: <error>"`; if one of its
-sidecars cannot be read, the main file is still checked and `wal` carries the error (see below). If the copy
+sidecars cannot be read, the main file is still checked and `wal` (or, for a `-shm`, `shm`) carries the error
+(see below). If the copy
 fails on the tool's side — the temporary directory is missing, full (`ENOSPC`), over quota (`EDQUOT`) or not
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
 `verify` exits 2.
@@ -132,16 +146,16 @@ frame's salt and its link in the running checksum chain, up to the last commit f
 | `"invalid: <reason>"`   | the header is unusable, so SQLite throws the whole `-wal` away — truncated, wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), failing checksum, a page size different from the database’s (header bytes 16–17), or a first frame whose salt differs from the header’s |
 | `"invalid: 0 of <M> frames will be replayed (<reason>)"` | the header is fine but not one frame is replayed — the `-wal` holds frames and every one of them is lost, leaving only the main file |
 | `"invalid: <N> of <M> frames will be replayed (<reason>; dropped frame <K> is a commit frame, so a committed transaction is lost)"` | the dropped frames are not an uncommitted tail: frame `K` past the break commits a transaction that was written in full, so the restore silently loses it (and everything committed after it) |
-| `"symlink-skipped"`     | a sidecar of the unit is a symbolic link: it is not followed, so the unit could not be copied as it stands and what its `-wal` holds is unknown |
-| `"unreadable: <path>: <error>"` | a sidecar of the unit could not be read from the audited tree (permissions, IO error): it is not copied either, so again the unit is not the one that would be restored |
+| `"symlink-outside"` / `"symlink-dangling"` | the unit's `-wal` is a symbolic link leading out of the audited directory, or nowhere: it is not followed, so the unit could not be copied as it stands and what its `-wal` holds is unknown |
+| `"unreadable: <path>: <error>"` | the unit's `-wal` could not be read from the audited tree (permissions, IO error): it is not copied either, so again the unit is not the one that would be restored |
 
 `M` counts the frames the `-wal` really holds, from the first one to the last of its generation — not just the
 frames up to the break. A frame the file cuts short counts as one; frames carrying an older generation’s salts
 do not count at all, as they were checkpointed into the database long ago.
 
-An `invalid`, `symlink-skipped` or `unreadable` `wal` makes `verify` exit 1 even when `integrity` is `ok`; an
-`ok` one never does, however many frames its tail drops — discarding an uncommitted tail *is* SQLite’s crash recovery, and no
-transaction that was ever reported committed is lost. The frame accounting is reported either way, so a caller
+An `invalid`, `symlink-outside`, `symlink-dangling` or `unreadable` `wal` makes `verify` exit 1 even when
+`integrity` is `ok`; an `ok` one never does, however many frames its tail drops — discarding an uncommitted
+tail *is* SQLite’s crash recovery, and no transaction that was ever reported committed is lost. The frame accounting is reported either way, so a caller
 that wants to know how much of a `-wal` survived the copy can read it. These checks catch garbage, truncated,
 damaged, half-written and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different*
 database with the same page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would
@@ -149,9 +163,16 @@ replay it. Past a broken checksum the frames can only be read as bytes, not veri
 frames that none of them commits is taken at face value: a `-wal` corrupted inside a transaction that was
 never committed is reported as the ordinary tail of a live copy.
 
+A `-shm` sidecar that could not be copied — a link leading out of the tree or nowhere, or a file whose
+permissions deny reading it — is reported in a separate `shm` key (`"symlink-outside"`,
+`"symlink-dangling"` or `"unreadable: <path>: <error>"`) and as a warning on stderr, but it does **not**
+fail the unit and does not stop the `-wal` from being checked: a `-shm` is a wal-index that SQLite rebuilds
+from the `-wal`, so it holds no row that the copy could lose. Its unit is copied and checked as usual,
+row counts included, and `verify` can still exit 0.
+
 A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
-of `null`. `orphan-sidecar` and `not-sqlite` entries (including the skipped symlinks) are reported unchanged,
-without `integrity`/`tables`/`wal`.
+of `null`. `orphan-sidecar` and `not-sqlite` entries (including the links that were not followed) are reported
+unchanged, without `integrity`/`tables`/`wal`.
 
 ## Classes
 
@@ -162,12 +183,14 @@ without `integrity`/`tables`/`wal`.
 | `orphan-sidecar` | a `-wal` and/or `-shm` whose main file is missing or is not SQLite                                   | the expected (missing) main path  |
 | `not-sqlite`     | a file named `*.db`, `*.sqlite` or `*.sqlite3` (any case) without the SQLite header, including empty files | the file                          |
 
-These four are the only values of `class`. An entry may also carry `"skipped": "symlink"`: its `main` is a
-symbolic link to a file that is not a sidecar of a database, and it was not followed, so its target was
+These four are the only values of `class`. An entry may also carry `"skipped"`, with the value
+`"symlink-outside"` or `"symlink-dangling"`: its `main` is a symbolic link that is not a sidecar of a
+database and that leads out of the audited directory or nowhere, so it was not followed and its target was
 neither read nor checked. Such an entry is classed `not-sqlite` because no SQLite header was read from it —
 `skipped` is there so that a consumer can tell "the header says this is not a database" from "the file was
 never opened". Like any other `not-sqlite` entry it makes `verify` exit 1: a tree in which nothing was opened
-is not a tree that was checked.
+is not a tree that was checked. A link resolving inside the directory carries no `skipped` key at all — it was
+read, and is classified by what its target holds.
 
 A name ending in `-wal` or `-shm` makes a file a sidecar of the name in front of the suffix, whatever it
 contains and whether or not it can be read — that grouping happens before any header is read. When
@@ -178,8 +201,8 @@ file named exactly `-wal` or `-shm` has no main file name in front of the suffix
 
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
-| 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries |
-| 1    | —                                  | any `orphan-sidecar` or `not-sqlite` entry (including one with `"skipped": "symlink"`), any integrity other than `ok`, or any `invalid`/`symlink-skipped`/`unreadable` `wal` (all entries are still printed) |
+| 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | the whole tree was audited, every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries |
+| 1    | —                                  | any path could not be audited (unreadable file or directory, unfollowed link, symlinked directory leading out of the tree; a `-shm` does not count), any `orphan-sidecar` or `not-sqlite` entry (including one with a `"skipped"` key), any integrity other than `ok`, or any `invalid`/`symlink-outside`/`symlink-dangling`/`unreadable` `wal` (all entries are still printed) |
 | 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools

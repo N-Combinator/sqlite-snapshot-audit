@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from .audit import AuditError, has_problems, not_checked, scan, verify
+from .audit import AuditError, Warnings, has_problems, not_checked, scan, unaudited, verify
 
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
@@ -53,6 +53,8 @@ def _format_text(entries: list[dict]) -> str:
                 )
         if "wal" in entry:
             line += f"; wal: {entry['wal']}"
+        if "shm" in entry:
+            line += f"; shm: {entry['shm']}"
         if "skipped" in entry:
             line += f"; skipped: {entry['skipped']}"
         lines.append(_printable(line))
@@ -61,7 +63,7 @@ def _format_text(entries: list[dict]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    warnings: list[str] = []
+    warnings = Warnings()
     try:
         if args.command == "verify":
             entries = verify(args.dir, warnings)
@@ -75,6 +77,16 @@ def main(argv: list[str] | None = None) -> int:
     for warning in warnings:
         # stderr, so that the entries on stdout stay a plain list and byte-identical
         print(f"sqlite-snapshot-audit: warning: {_printable(warning)}", file=sys.stderr)
+    missed = unaudited(warnings)
+    if missed:
+        # the count is the point: an audit that could not look at part of the tree has not
+        # cleared that tree, however clean everything it did look at turned out to be
+        print(
+            f"sqlite-snapshot-audit: {len(missed)} path(s) could not be audited "
+            "(unreadable, or a symbolic link that was not followed); "
+            "the tree was not audited in full",
+            file=sys.stderr,
+        )
 
     if args.json:
         sys.stdout.write(json.dumps(entries, indent=2) + "\n")
@@ -94,6 +106,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_ERROR
-    if has_problems(entries):
+    if missed or has_problems(entries):
         return EXIT_PROBLEMS
     return EXIT_OK

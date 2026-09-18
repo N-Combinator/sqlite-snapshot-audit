@@ -417,11 +417,14 @@ def test_unreadable_file_is_a_warning_and_the_rest_is_audited(tmp_path, capsys):
         locked.chmod(0o600)
     assert [e["main"] for e in entries] == ["a.db"]
     assert warnings == [f"skipped locked.db: {os.strerror(errno.EACCES)}"]
-    assert code == 0
+    # the readable database is still audited, but a file nobody could read was not
+    assert code == 1
     assert [e["main"] for e in json.loads(out)] == ["a.db"]
     assert err == (
         "sqlite-snapshot-audit: warning: skipped locked.db: "
         f"{os.strerror(errno.EACCES)}\n"
+        "sqlite-snapshot-audit: 1 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full\n"
     )
 
 
@@ -441,11 +444,13 @@ def test_unreadable_subdirectory_is_a_warning_and_the_rest_is_audited(tmp_path, 
         code, out, err = run_cli(capsys, "verify", str(tmp_path), "--json")
     finally:
         locked.chmod(0o700)
-    assert code == 0
+    assert code == 1  # the rest of the tree is audited, but this subtree was not
     assert [e["main"] for e in json.loads(out)] == ["a.db", "sub/b.db"]
     assert err == (
         "sqlite-snapshot-audit: warning: skipped lost+found: "
         f"{os.strerror(errno.EACCES)}\n"
+        "sqlite-snapshot-audit: 1 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full\n"
     )
 
 
@@ -544,7 +549,10 @@ def test_special_files_and_symlinked_dirs_are_skipped(tmp_path):
     warnings = []
     # the FIFO is not read, but the dangling link is still a file in the tree and is reported
     assert [e["main"] for e in scan(str(root), warnings)] == ["dangling.db", "real.db"]
-    assert warnings == ["symlinked directory not followed: linked-dir"]
+    assert warnings == [
+        "symlinked directory not followed: linked-dir",
+        "symbolic link not followed: dangling.db (target is missing)",
+    ]
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
@@ -569,12 +577,31 @@ def test_symlinked_directory_is_warned_about_not_silently_skipped(tmp_path, caps
     ]
 
     code, out, err = run_cli(capsys, "verify", str(root), "--json")
-    assert code == 0  # an unaudited subtree is not a problem with the audited one
+    assert code == 1  # two subtrees were never looked at, so the tree was not cleared
     assert [e["main"] for e in json.loads(out)] == ["real.db"]
     assert err == (
         "sqlite-snapshot-audit: warning: symlinked directory not followed: linked-dir\n"
         "sqlite-snapshot-audit: warning: symlinked directory not followed: sub/nested-link\n"
+        "sqlite-snapshot-audit: 2 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full\n"
     )
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlinked_directory_pointing_inside_the_tree_is_not_a_missed_subtree(tmp_path, capsys):
+    """Its files are walked under their real path, so nothing is missing from the audit."""
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    make_db(root / "sub" / "real.db", rows=1)
+    (root / "same-again").symlink_to(root / "sub", target_is_directory=True)
+
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    assert [e["main"] for e in json.loads(out)] == ["sub/real.db"]
+    assert err == (
+        "sqlite-snapshot-audit: warning: symlinked directory not followed: same-again "
+        "(its target is inside the audited directory and is audited there)\n"
+    )
+    assert code == 0  # not counted as skipped: every file behind the link was audited
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
@@ -605,23 +632,27 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
         ("link.db", "not-sqlite"),
         # the symlinked -wal is grouped by name, so the database is not called standalone
         ("real.db", "wal-family"),
-        ("sub/inside.sqlite", "not-sqlite"),
+        # this one resolves inside the audited tree: read and classified like any file
+        ("sub/inside.sqlite", "standalone"),
         ("sub/notes.txt", "not-sqlite"),
     ]
-    entries = scan(str(root))
+    warnings = []
+    entries = scan(str(root), warnings)
     assert [(e["main"], e["class"]) for e in entries] == expected
-    assert [e["main"] for e in entries if e.get("skipped")] == [
-        "link.db",
-        "sub/inside.sqlite",
-        "sub/notes.txt",
-    ]
+    assert [e["main"] for e in entries if e.get("skipped")] == ["link.db", "sub/notes.txt"]
     for entry in entries:
         if entry.get("skipped"):
-            assert entry["skipped"] == "symlink"
+            assert entry["skipped"] == "symlink-outside"
             assert entry["sidecars"] == []
             assert entry["reason"] == (
-                "symbolic link to a file; not followed, so no SQLite header was read"
+                "symbolic link to a file outside the audited directory; "
+                "not followed, so no SQLite header was read"
             )
+    assert sorted(warnings) == [
+        "symbolic link not followed: link.db (target is outside the audited directory)",
+        "symbolic link not followed: real.db-wal (target is outside the audited directory)",
+        "symbolic link not followed: sub/notes.txt (target is outside the audited directory)",
+    ]
     assert by_main(entries)["real.db"]["sidecars"] == ["real.db-wal"]
     assert by_main(entries)["real.db"]["reason"] == (
         "SQLite database with -wal sidecar, no -shm; symbolic link not followed: real.db-wal"
@@ -631,8 +662,9 @@ def test_file_symlinks_are_reported_not_followed(tmp_path, monkeypatch, capsys):
     assert code == 1  # the -wal that would be replayed was not checked
     entries = json.loads(out)
     assert [(e["main"], e["class"]) for e in entries] == expected
-    assert [e["main"] for e in entries if "integrity" in e] == ["real.db"]
-    assert by_main(entries)["real.db"]["wal"] == "symlink-skipped"
+    assert [e["main"] for e in entries if "integrity" in e] == ["real.db", "sub/inside.sqlite"]
+    assert by_main(entries)["real.db"]["wal"] == "symlink-outside"
+    assert by_main(entries)["sub/inside.sqlite"]["tables"] == {"items": 2}
     assert all(e["class"] in CONTRACT_CLASSES for e in entries)
     assert "elsewhere" not in out and str(outside) not in out
     assert tree_hashes(outside) == outside_before
@@ -650,7 +682,7 @@ def test_symlinked_wal_does_not_make_a_live_database_look_standalone(tmp_path, c
     (entry,) = json.loads(out)
     assert entry["class"] == "wal-family"
     assert entry["sidecars"] == ["app.db-wal"]
-    assert entry["wal"] == "symlink-skipped"
+    assert entry["wal"] == "symlink-outside"
     # without its -wal the copy misses the uncheckpointed rows, and that must not pass
     assert entry["integrity"] == "ok"
     assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
@@ -658,21 +690,38 @@ def test_symlinked_wal_does_not_make_a_live_database_look_standalone(tmp_path, c
 
     code, out, _ = run_cli(capsys, "verify", str(root))
     assert code == 1
-    assert "wal: symlink-skipped" in out
+    assert "wal: symlink-outside" in out
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
-def test_symlinked_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, live_wal_db):
+def test_symlinked_shm_does_not_fail_a_healthy_family_or_mute_the_wal_check(
+    tmp_path, capsys, live_wal_db
+):
+    """A -shm holds no rows: SQLite rebuilds it from the -wal, so the unit is still checked."""
     root = tmp_path / "root"
     root.mkdir()
     shutil.copyfile(live_wal_db, root / "app.db")
     shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
     (root / "app.db-shm").symlink_to(str(live_wal_db) + "-shm")
-    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
     (entry,) = json.loads(out)
     assert entry["sidecars"] == ["app.db-shm", "app.db-wal"]
-    assert entry["wal"] == "symlink-skipped"  # the unit could not be copied as it stands
-    assert code == 1
+    assert entry["shm"] == "symlink-outside"  # reported, but it costs the audit nothing
+    assert entry["wal"].startswith("ok (")  # the -wal was still checked, not muted
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {
+        "events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL
+    }
+    assert err == (
+        "sqlite-snapshot-audit: warning: symbolic link not followed: app.db-shm "
+        "(target is outside the audited directory) "
+        "(a -shm holds no data; its unit is still checked)\n"
+    )
+    assert code == 0
+
+    code, text_out, _ = run_cli(capsys, "verify", str(root))
+    assert code == 0
+    assert "shm: symlink-outside" in text_out
 
 
 @pytest.mark.skipif(
@@ -698,7 +747,7 @@ def test_unreadable_wal_does_not_make_a_live_database_look_standalone(
     assert [(e["main"], e["sidecars"], e["class"]) for e in entries] == [
         ("app.db", ["app.db-wal"], "wal-family")
     ]
-    assert warnings == []
+    assert warnings == []  # scan never reads a sidecar, so nothing failed there
     (entry,) = json.loads(out)
     assert entry["class"] == "wal-family"
     assert entry["wal"] == f"unreadable: app.db-wal: {os.strerror(errno.EACCES)}"
@@ -706,7 +755,11 @@ def test_unreadable_wal_does_not_make_a_live_database_look_standalone(
     assert entry["integrity"] == "ok"
     assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
     assert code == 1
-    assert err == ""
+    assert err == (
+        f"sqlite-snapshot-audit: warning: skipped app.db-wal: {os.strerror(errno.EACCES)}\n"
+        "sqlite-snapshot-audit: 1 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full\n"
+    )
     assert text_code == 1
     assert "wal: unreadable: app.db-wal" in text_out
 
@@ -714,7 +767,9 @@ def test_unreadable_wal_does_not_make_a_live_database_look_standalone(
 @pytest.mark.skipif(
     not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable files"
 )
-def test_unreadable_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, live_wal_db):
+def test_unreadable_shm_does_not_fail_a_healthy_family_or_mute_the_wal_check(
+    tmp_path, capsys, live_wal_db
+):
     root = tmp_path / "root"
     root.mkdir()
     shutil.copyfile(live_wal_db, root / "app.db")
@@ -722,13 +777,80 @@ def test_unreadable_shm_next_to_a_real_wal_is_also_reported(tmp_path, capsys, li
     (root / "app.db-shm").write_bytes(b"\x00" * 32)
     (root / "app.db-shm").chmod(0)
     try:
-        code, out, _ = run_cli(capsys, "verify", str(root), "--json")
+        code, out, err = run_cli(capsys, "verify", str(root), "--json")
     finally:
         (root / "app.db-shm").chmod(0o600)
     (entry,) = json.loads(out)
     assert entry["sidecars"] == ["app.db-shm", "app.db-wal"]
-    assert entry["wal"].startswith("unreadable: app.db-shm: ")
-    assert code == 1  # the unit could not be copied as it stands
+    assert entry["shm"] == f"unreadable: app.db-shm: {os.strerror(errno.EACCES)}"
+    assert entry["wal"].startswith("ok (")  # the -wal was read and replayed as it stands
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL}
+    assert err == (
+        f"sqlite-snapshot-audit: warning: skipped app.db-shm: {os.strerror(errno.EACCES)}"
+        " (a -shm holds no data; its unit is still checked)\n"
+    )
+    # it is not counted as an unaudited path either: there was nothing in it to audit
+    assert code == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_dangling_shm_link_does_not_fail_its_family(tmp_path, capsys, live_wal_db):
+    """Same as the outward -shm: what is missing is an index, not a row."""
+    root = tmp_path / "root"
+    root.mkdir()
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "app.db-wal")
+    (root / "app.db-shm").symlink_to(tmp_path / "gone" / "app.db-shm")
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"
+    assert entry["shm"] == "symlink-dangling"
+    assert entry["wal"].startswith("ok (")
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL}
+    assert "a -shm holds no data" in err
+    assert code == 0
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read unreadable paths"
+)
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_verify_does_not_exit_0_when_the_tree_was_not_audited_in_full(tmp_path, capsys):
+    """Exit 0 must mean "this tree was checked", not "the part I could read was fine"."""
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    make_db(outside / "hidden.db", rows=1)
+    make_db(root / "good.db", rows=3)
+    locked_file = root / "locked.db"
+    make_db(locked_file, rows=1)
+    locked_file.chmod(0)
+    locked_dir = root / "lost+found"
+    locked_dir.mkdir()
+    make_db(locked_dir / "hidden.db", rows=1)
+    locked_dir.chmod(0)
+    (root / "linked-dir").symlink_to(outside, target_is_directory=True)
+    try:
+        code, out, err = run_cli(capsys, "verify", str(root), "--json")
+        # scan says the same on stderr but does not turn it into an exit code
+        scan_code, _, scan_err = run_cli(capsys, "scan", str(root), "--json")
+    finally:
+        locked_file.chmod(0o600)
+        locked_dir.chmod(0o700)
+
+    assert "3 path(s) could not be audited" in scan_err
+    assert scan_code == 0
+
+    # everything that was audited is still reported, in full
+    assert [(e["main"], e["integrity"], e["tables"]) for e in json.loads(out)] == [
+        ("good.db", "ok", {"items": 3})
+    ]
+    assert err.splitlines()[-1] == (
+        "sqlite-snapshot-audit: 3 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full"
+    )
+    assert code == 1
 
 
 @pytest.mark.skipif(
@@ -755,6 +877,8 @@ def test_unreadable_main_next_to_a_sidecar_is_an_orphan(tmp_path, capsys, live_w
     ]
     assert err == (
         f"sqlite-snapshot-audit: warning: skipped app.db: {os.strerror(errno.EACCES)}\n"
+        "sqlite-snapshot-audit: 1 path(s) could not be audited (unreadable, or a symbolic "
+        "link that was not followed); the tree was not audited in full\n"
     )
 
 
@@ -789,29 +913,77 @@ def test_symlinked_sidecar_without_a_main_file_is_an_orphan(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
-def test_skipped_symlink_makes_verify_exit_1_like_any_not_sqlite_entry(tmp_path, capsys):
-    """A link is never opened, so nothing about its target was established: not a pass."""
-    make_db(tmp_path / "a.db", rows=1)
-    (tmp_path / "link.db").symlink_to(tmp_path / "a.db")
-    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+def test_outward_symlink_makes_verify_exit_1_like_any_not_sqlite_entry(tmp_path, capsys):
+    """It is never opened, so nothing about its target was established: not a pass."""
+    root = tmp_path / "root"
+    root.mkdir()
+    make_db(root / "a.db", rows=1)
+    make_db(tmp_path / "elsewhere.db", rows=1)
+    (root / "link.db").symlink_to(tmp_path / "elsewhere.db")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
     assert code == 1
     assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
         ("a.db", "standalone", None),
-        ("link.db", "not-sqlite", "symlink"),
+        ("link.db", "not-sqlite", "symlink-outside"),
     ]
-    code, out, _ = run_cli(capsys, "verify", str(tmp_path))
+    code, out, _ = run_cli(capsys, "verify", str(root))
     assert code == 1
-    assert "not-sqlite      link.db" in out and "skipped: symlink" in out
+    assert "not-sqlite      link.db" in out and "skipped: symlink-outside" in out
 
-    (tmp_path / "notes.db").write_text("text")
-    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (root / "notes.db").write_text("text")
+    code, out, _ = run_cli(capsys, "verify", str(root), "--json")
     assert code == 1
     assert len(json.loads(out)) == 3
 
-    (tmp_path / "link.db").unlink()
-    (tmp_path / "notes.db").unlink()
-    code, _, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (root / "link.db").unlink()
+    (root / "notes.db").unlink()
+    code, _, _ = run_cli(capsys, "verify", str(root), "--json")
     assert code == 0  # without the link the same tree is clean
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_symlink_resolving_inside_the_tree_is_audited_like_a_regular_file(
+    tmp_path, capsys, live_wal_db
+):
+    """Its target is part of the tree that would be restored, so it is read, not skipped."""
+    root = tmp_path / "root"
+    (root / "store").mkdir(parents=True)
+    shutil.copyfile(live_wal_db, root / "store" / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-wal", root / "store" / "app.db-wal")
+    # the whole unit reaches the restore point through links, as a layout of hard-linked
+    # or symlinked "current" snapshots does
+    (root / "current.db").symlink_to(root / "store" / "app.db")
+    (root / "current.db-wal").symlink_to(root / "store" / "app.db-wal")
+    (root / "text.db").write_text("not a database\n")
+    (root / "text-link.db").symlink_to(root / "text.db")
+
+    warnings = []
+    entries = scan(str(root), warnings)
+    assert warnings == []  # nothing was skipped, so there is nothing to warn about
+    assert [(e["main"], e["sidecars"], e["class"]) for e in entries] == [
+        ("current.db", ["current.db-wal"], "wal-family"),
+        ("store/app.db", ["store/app.db-wal"], "wal-family"),
+        ("text-link.db", [], "not-sqlite"),  # classified by header, like its target
+        ("text.db", [], "not-sqlite"),
+    ]
+    assert not [e for e in entries if e.get("skipped")]
+    assert by_main(entries)["current.db"]["reason"] == (
+        "SQLite database with -wal sidecar, no -shm"
+    )
+
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    linked = by_main(json.loads(out))["current.db"]
+    assert linked["wal"].startswith("ok (")
+    assert linked["integrity"] == "ok"
+    # read through the links, the unit holds the rows that live only in its -wal
+    assert linked["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL}
+    assert err == ""
+    assert code == 1  # only because of the two text files, which are really not databases
+
+    (root / "text.db").unlink()
+    (root / "text-link.db").unlink()
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    assert (code, err) == (0, "")  # a tree reached through links is a tree that passes
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
@@ -824,7 +996,7 @@ def test_tree_of_only_symlinks_does_not_exit_0(tmp_path, capsys):
     code, out, _ = run_cli(capsys, "verify", str(root), "--json")
     assert code == 1
     assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
-        ("app.db", "not-sqlite", "symlink"),
+        ("app.db", "not-sqlite", "symlink-outside"),
     ]
 
 
@@ -835,7 +1007,7 @@ def test_dangling_symlink_is_reported_like_any_other_link(tmp_path, capsys):
     assert code == 1  # a link that is not a sidecar was never opened, so nothing is known
     assert [(e["main"], e["class"], e.get("skipped")) for e in json.loads(out)] == [
         ("a.db", "standalone", None),
-        ("dangling.db", "not-sqlite", "symlink"),
+        ("dangling.db", "not-sqlite", "symlink-dangling"),
     ]
     assert by_main(json.loads(out))["dangling.db"]["reason"] == (
         "dangling symbolic link (target is missing); "
@@ -860,7 +1032,7 @@ def test_dangling_wal_symlink_does_not_make_a_live_database_look_standalone(
         "SQLite database with -wal sidecar, no -shm; "
         "symbolic link not followed: app.db-wal (dangling)"
     )
-    assert entry["wal"] == "symlink-skipped"
+    assert entry["wal"] == "symlink-dangling"
     assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
     assert code == 1
 
@@ -884,6 +1056,7 @@ def test_tree_of_broken_links_is_not_reported_as_having_nothing_wrong(tmp_path, 
             "app.db",
             "orphan-sidecar",
             "main path is a symbolic link whose target is missing; "
+            "not followed, so no SQLite header was read; "
             "symbolic link not followed: app.db-wal (dangling)",
         ),
     ]

@@ -1,11 +1,17 @@
 """Discover SQLite backup units under a directory and verify copies of them.
 
-Nothing under the scanned directory is ever opened for writing: ``scan`` reads
-at most the first 16 bytes of each regular file (symlinks are reported, not followed), and ``verify`` only opens
-SQLite (and reads -wal headers) on copies placed in a temporary directory outside the scanned tree.
+Nothing under the scanned directory is ever opened for writing: ``scan`` reads at most
+the first 16 bytes of each file, and ``verify`` only opens SQLite (and reads -wal
+headers) on copies placed in a temporary directory outside the scanned tree.
 
-Paths that cannot be read are collected in a ``warnings`` list and skipped, so one
-unreadable directory or file does not hide the rest of the tree.
+A symbolic link whose target resolves inside the scanned directory is an ordinary file
+here: what it points at is part of the tree that would be restored. A link that leaves
+the tree, or that does not resolve, is not followed.
+
+Paths that cannot be read or followed are collected in a ``warnings`` list and skipped,
+so one unreadable directory or file does not hide the rest of the tree; the paths whose
+content never reached the audit are counted separately (``unaudited``), because a tree
+that could not be audited in full is not a tree that passed.
 """
 
 from __future__ import annotations
@@ -28,13 +34,16 @@ NOT_SQLITE = "not-sqlite"
 
 VERIFIABLE = (STANDALONE, WAL_FAMILY)
 
-# value of the "skipped" key on an entry whose own path is a symbolic link that was not followed
-SKIPPED_SYMLINK = "symlink"
+# values of the "skipped" key (and of "wal"/"shm") for links that are not followed
+SKIPPED_OUTSIDE = "symlink-outside"
+SKIPPED_DANGLING = "symlink-dangling"
+LINK_NOTE = {
+    SKIPPED_OUTSIDE: "target is outside the audited directory",
+    SKIPPED_DANGLING: "target is missing",
+}
 # integrity prefix for units the tool itself could not check (temporary directory problems)
 NOT_CHECKED = "not-checked: "
-# wal value for a unit whose sidecar is a symlink, so the unit could not be copied as it stands
-SYMLINK_SKIPPED = "symlink-skipped"
-# wal prefix for a unit whose sidecar could not be read from the audited tree
+# wal/shm prefix for a unit whose sidecar could not be read from the audited tree
 UNREADABLE = "unreadable: "
 COPY_CHUNK_SIZE = 1024 * 1024
 
@@ -54,6 +63,45 @@ class _SourceError(Exception):
     """OSError while reading a file under the audited tree, as opposed to the temp dir."""
 
 
+class Warnings(list):
+    """The warning lines, plus the paths whose content never reached the audit.
+
+    ``unaudited`` is what makes "nothing wrong was found" different from "the tree was
+    checked": a path in it was not read at all, so no statement about it was ever made.
+    A plain list works everywhere a ``Warnings`` does; it just does not count.
+    """
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self.unaudited: list[str] = []
+
+
+def unaudited(warnings) -> list[str]:
+    """The paths the audit could not look at, for callers holding a plain list too."""
+    return list(getattr(warnings, "unaudited", []))
+
+
+def _warn(warnings: list[str], message: str, unaudited_path: str | None = None) -> None:
+    warnings.append(message)
+    if unaudited_path is not None and isinstance(warnings, Warnings):
+        warnings.unaudited.append(unaudited_path)
+
+
+def _carries_no_data(rel: str) -> bool:
+    """True for a ``-shm`` sidecar: a wal-index SQLite rebuilds, holding no rows of its own."""
+    name = os.path.basename(rel)
+    return name.endswith("-shm") and len(name) > len("-shm")
+
+
+def _warn_skipped(warnings: list[str], message: str, rel: str) -> None:
+    """Warn about a path that was not read, counting it unless it is a -shm."""
+    if _carries_no_data(rel):
+        # not seeing a -shm costs nothing: it holds no data, SQLite rebuilds it from the -wal
+        warnings.append(message + " (a -shm holds no data; its unit is still checked)")
+    else:
+        _warn(warnings, message, rel)
+
+
 def _is_sqlite(path: str) -> bool:
     with open(path, "rb") as f:
         return f.read(len(SQLITE_HEADER)) == SQLITE_HEADER
@@ -67,13 +115,35 @@ def _warning(root: str, path: str, exc: OSError) -> str:
     return f"skipped {_relative(root, path)}: {exc.strerror or exc}"
 
 
-def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str], set[str]]:
-    """Return (regular files, symlinks, dangling ones) under root, relative and "/"-separated.
+def _link_status(root: str, path: str) -> str | None:
+    """Why ``path`` is a symbolic link that is not followed, or None if it is followed.
 
-    Symlinks are never followed: their targets may lie outside root. Whether a link
-    resolves is recorded but never decides whether it is reported -- a broken ``-wal``
-    link still belongs to its database, and dropping it would make that database look
-    standalone and be verified without the WAL it needs.
+    A link resolving to something inside root points at a file the audit covers anyway,
+    so it is read like any other file. A link leaving root reaches outside the tree that
+    would be restored (and could reach anywhere on the host), and a link that does not
+    resolve has nothing to read: both are reported instead of followed.
+    """
+    try:
+        if not stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+    except OSError:
+        return None
+    if not os.path.exists(path):
+        return SKIPPED_DANGLING
+    return None if _inside(path, root) else SKIPPED_OUTSIDE
+
+
+def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Return (files, links not followed) under root, relative and "/"-separated.
+
+    The first value holds every file whose content is part of the audited tree: regular
+    files, and symlinks resolving to a regular file inside root, which are read exactly
+    like the file they point at. The second maps the links that are *not* followed --
+    those leaving root, and those that do not resolve -- to why (see _link_status).
+
+    A link that is not followed is still reported: a broken or outward ``-wal`` link
+    belongs to its database, and dropping it would make that database look standalone
+    and be verified without the WAL it needs.
 
     A directory that cannot be read (a root-only ``lost+found``, say) is recorded in
     ``warnings`` and skipped; the rest of the tree is still audited. Only root itself
@@ -84,17 +154,28 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str], s
     def on_error(err: OSError) -> None:
         if err.filename is None or os.path.abspath(err.filename) == os.path.abspath(root):
             raise err
-        warnings.append(_warning(root, err.filename, err))
+        _warn(warnings, _warning(root, err.filename, err), _relative(root, err.filename))
 
-    regular, symlinks, dangling = [], [], set()
+    regular: list[str] = []
+    skipped: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
         dirnames.sort()
         for name in dirnames:
             full = os.path.join(dirpath, name)
-            if os.path.islink(full):
-                # os.walk is called with followlinks=False, so the subtree behind the link
-                # (which may lie outside root entirely) is not audited: say so.
-                warnings.append(f"symlinked directory not followed: {_relative(root, full)}")
+            rel = _relative(root, full)
+            if not os.path.islink(full):
+                continue
+            # os.walk is called with followlinks=False, so the subtree behind the link is
+            # not descended into (a link back up the tree would loop forever): say so.
+            if _link_status(root, full) is None:
+                # it points inside root, so the same files are walked under their real
+                # path: nothing is missing from the audit and nothing is counted skipped
+                warnings.append(
+                    f"symlinked directory not followed: {rel} "
+                    "(its target is inside the audited directory and is audited there)"
+                )
+            else:
+                _warn(warnings, f"symlinked directory not followed: {rel}", rel)
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = _relative(root, full)
@@ -104,57 +185,68 @@ def _walk_files(root: str, warnings: list[str]) -> tuple[list[str], list[str], s
                 # the file vanished while walking
                 continue
             except OSError as exc:
-                warnings.append(_warning(root, full, exc))
+                _warn_skipped(warnings, _warning(root, full, exc), rel)
                 continue
             if stat.S_ISLNK(st.st_mode):
-                # classified from lstat alone: a link that does not resolve is still a file
-                # in the tree and still part of its unit, it just cannot be restored from
-                symlinks.append(rel)
-                if not os.path.exists(full):
-                    dangling.add(rel)
-                continue
+                status = _link_status(root, full)
+                if status is not None:
+                    skipped[rel] = status
+                    _warn_skipped(
+                        warnings, f"symbolic link not followed: {rel} ({LINK_NOTE[status]})", rel
+                    )
+                    continue
+                try:
+                    st = os.stat(full)  # the target, which lies inside the audited tree
+                except OSError as exc:
+                    _warn_skipped(warnings, _warning(root, full, exc), rel)
+                    continue
             if not stat.S_ISREG(st.st_mode):
                 # FIFOs, sockets, devices: reading them could block or be destructive
                 continue
             regular.append(rel)
-    return sorted(regular), sorted(symlinks), dangling
+    return sorted(regular), skipped
 
 
-def _note_links(reason: str, family: list[str], links: set[str], dangling: set[str]) -> str:
-    """Add the sidecars of a unit that are symlinks (and so were not read) to its reason."""
-    linked = [rel + (" (dangling)" if rel in dangling else "") for rel in family if rel in links]
+def _note_links(reason: str, family: list[str], skipped: dict[str, str]) -> str:
+    """Add the sidecars of a unit that are links not followed (so not read) to its reason."""
+    linked = [
+        rel + (" (dangling)" if skipped[rel] == SKIPPED_DANGLING else "")
+        for rel in family
+        if rel in skipped
+    ]
     if not linked:
         return reason
     return reason + "; symbolic link not followed: " + ", ".join(linked)
 
 
 def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
-    """Classify every SQLite database, sidecar, would-be database and file symlink under root.
+    """Classify every SQLite database, sidecar, would-be database and unfollowed link under root.
 
-    A file symlink that is not a sidecar is reported with ``"skipped": "symlink"`` and the
-    ``not-sqlite`` class: it is not followed, so no header was read to classify it.
+    A symlink resolving to a regular file inside root is classified from its target's
+    header like any other file. A link that leaves root or does not resolve is not
+    followed: if it is not a sidecar it gets an entry of its own with the ``not-sqlite``
+    class and ``"skipped": "symlink-outside"`` / ``"symlink-dangling"``.
 
     Returns entries sorted by ``main`` (then ``class``); paths are relative to root.
     Paths that cannot be read are appended to ``warnings`` and left out of the entries;
     AuditError is raised only if root itself is not a readable directory.
     """
     if warnings is None:
-        warnings = []
+        warnings = Warnings()
     if not os.path.isdir(root):
         raise AuditError(f"not a directory: {root}")
 
     try:
-        files, symlinks, dangling = _walk_files(root, warnings)
+        files, skipped = _walk_files(root, warnings)
     except OSError as exc:
         raise AuditError(str(exc)) from exc
 
-    # A sidecar is recognised by its name alone: symlink or not, readable or not, and before
-    # any header is read. Leaving a sidecar out of its family -- because it is a link, or
-    # because its permissions deny reading it -- would make its database look standalone and
-    # be verified without the WAL it needs.
-    links = set(symlinks)
+    # A sidecar is recognised by its name alone: link or not, readable or not, and before
+    # any header is read. Leaving a sidecar out of its family -- because it is a link that
+    # was not followed, or because its permissions deny reading it -- would make its
+    # database look standalone and be verified without the WAL it needs.
     sidecars: dict[str, list[str]] = {}
-    for rel in sorted(files + symlinks):
+    for rel in sorted(files + list(skipped)):
         if rel.endswith(SIDECAR_SUFFIXES) and len(os.path.basename(rel)) > len("-wal"):
             sidecars.setdefault(rel[: -len("-wal")], []).append(rel)
     # paths reported inside the unit they belong to instead of on their own
@@ -170,7 +262,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
         try:
             is_database = _is_sqlite(os.path.join(root, rel))
         except OSError as exc:
-            warnings.append(_warning(root, os.path.join(root, rel), exc))
+            _warn_skipped(warnings, _warning(root, os.path.join(root, rel), exc), rel)
             unreadable[rel] = exc.strerror or str(exc)
             continue
         if is_database:
@@ -194,7 +286,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
                 "main": main,
                 "sidecars": family,
                 "class": cls,
-                "reason": _note_links(reason, family, links, dangling),
+                "reason": _note_links(reason, family, skipped),
             }
         )
 
@@ -206,10 +298,11 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             reason = f"main file could not be read: {unreadable[main]}"
         elif main in regular:
             reason = "main file exists but has no SQLite header"
-        elif main in dangling:
-            reason = "main path is a symbolic link whose target is missing"
-        elif main in links:
-            reason = "main path is a symbolic link; not followed, so no SQLite header was read"
+        elif main in skipped:
+            reason = (
+                f"main path is a symbolic link whose {LINK_NOTE[skipped[main]]}; "
+                "not followed, so no SQLite header was read"
+            )
         elif os.path.lexists(os.path.join(root, main)):
             reason = "main path exists but is not a regular file"
         else:
@@ -220,7 +313,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
                 "main": main,
                 "sidecars": family,
                 "class": ORPHAN_SIDECAR,
-                "reason": _note_links(reason, family, links, dangling),
+                "reason": _note_links(reason, family, skipped),
             }
         )
 
@@ -233,7 +326,7 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
         reason = "empty file" if empty else "database file name but no SQLite header"
         entries.append({"main": main, "sidecars": [], "class": NOT_SQLITE, "reason": reason})
 
-    for main in symlinks:
+    for main, status in sorted(skipped.items()):
         if main in adopted:
             # already reported in the sidecars of the unit it belongs to
             continue
@@ -241,17 +334,17 @@ def scan(root: str, warnings: list[str] | None = None) -> list[dict]:
             {
                 "main": main,
                 "sidecars": [],
-                # every class is decided by reading a header, which a symlink is never read for;
-                # "skipped" tells a consumer that the class was not established, not that the
-                # target is junk, and keeps the class field to the four documented values
+                # every class is decided by reading a header, which such a link is never read
+                # for; "skipped" tells a consumer that the class was not established, not that
+                # the target is junk, and keeps the class field to the four documented values
                 "class": NOT_SQLITE,
                 "reason": (
                     "dangling symbolic link (target is missing)"
-                    if main in dangling
-                    else "symbolic link to a file"
+                    if status == SKIPPED_DANGLING
+                    else "symbolic link to a file outside the audited directory"
                 )
                 + "; not followed, so no SQLite header was read",
-                "skipped": SKIPPED_SYMLINK,
+                "skipped": status,
             }
         )
 
@@ -492,9 +585,13 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
     returned as ``scan`` produced them. If the temporary copy cannot be made for a
     reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``. Checked
     entries with a -wal sidecar also gain ``wal`` (see _check_wal); so do units whose
-    sidecar is a symlink (not followed) or cannot be read, since neither is copied and
-    what it holds is therefore unknown.
+    ``-wal`` is a link that is not followed or cannot be read, since neither is copied
+    and what it holds is therefore unknown. A ``-shm`` in that state gains ``shm``
+    instead and a warning: it holds no data of its own, SQLite rebuilds it from the
+    ``-wal``, so the unit is checked as usual and still passes.
     """
+    if warnings is None:
+        warnings = Warnings()
     entries = scan(root, warnings)
     if _inside(tempfile.gettempdir(), root):
         raise AuditError(
@@ -511,14 +608,17 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             continue
         with tmp_dir as tmp:
             copy = os.path.join(tmp, os.path.basename(entry["main"]))
-            # a symlinked sidecar may point outside root, so it is neither read nor copied;
+            # a link that leaves the tree (or resolves nowhere) is neither read nor copied;
             # the unit is then not the one that would be restored, whatever the copy says
-            linked = [rel for rel in entry["sidecars"] if os.path.islink(os.path.join(root, rel))]
-            copied = [rel for rel in entry["sidecars"] if rel not in linked]
-            unreadable = []
+            problems: dict[str, str] = {}
+            copied = []
             try:
                 _copy_file(os.path.join(root, entry["main"]), copy)
-                for rel in copied:
+                for rel in entry["sidecars"]:
+                    status = _link_status(root, os.path.join(root, rel))
+                    if status is not None:
+                        problems[rel] = status
+                        continue
                     dst = os.path.join(tmp, os.path.basename(rel))
                     try:
                         _copy_file(os.path.join(root, rel), dst)
@@ -527,19 +627,25 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
                         # unit is then not the one that would be restored, and says so below
                         _discard(dst)
                         cause = exc.args[0]
-                        unreadable.append(f"{rel}: {getattr(cause, 'strerror', None) or cause}")
+                        error = getattr(cause, "strerror", None) or cause
+                        problems[rel] = UNREADABLE + f"{rel}: {error}"
+                        _warn_skipped(warnings, f"skipped {rel}: {error}", rel)
+                    else:
+                        copied.append(rel)
             except _SourceError as exc:
                 entry["integrity"], entry["tables"] = f"copy failed: {exc}", {}
                 continue
             except OSError as exc:
                 entry["integrity"], entry["tables"] = NOT_CHECKED + str(exc), {}
                 continue
+            # A -shm that could not be copied does not hurt: it is a wal-index, SQLite
+            # rebuilds it from the -wal, so the check goes on and the unit can still pass.
+            shm = [text for rel, text in problems.items() if _carries_no_data(rel)]
+            wal_problems = [text for rel, text in problems.items() if not _carries_no_data(rel)]
             wal = None
             wals = [rel for rel in copied if rel.endswith("-wal")]
-            if linked:
-                wal = SYMLINK_SKIPPED
-            elif unreadable:
-                wal = UNREADABLE + "; ".join(unreadable)
+            if wal_problems:
+                wal = "; ".join(sorted(wal_problems))
             elif wals:
                 # before SQLite opens the copy, so the -wal is read exactly as it was copied
                 try:
@@ -549,6 +655,8 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             entry["integrity"], entry["tables"] = _check_copy(copy)
             if wal is not None:
                 entry["wal"] = wal
+            if shm:
+                entry["shm"] = "; ".join(sorted(shm))
     return entries
 
 
@@ -571,7 +679,8 @@ def has_problems(entries: list[dict]) -> bool:
             return True
         wal = entry.get("wal", "")
         if wal and not (wal == "empty" or wal.startswith(("ok", NOT_CHECKED))):
-            # "invalid:", "symlink-skipped", "unreadable:": the -wal that would be replayed
-            # is either unsound or was never seen at all
+            # "invalid:", "symlink-outside", "symlink-dangling", "unreadable:": the -wal that
+            # would be replayed is either unsound or was never seen at all. A -shm in the same
+            # state is in "shm" instead and does not land here: it holds no data to lose.
             return True
     return False
