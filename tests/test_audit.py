@@ -510,7 +510,8 @@ def test_sidecar_next_to_non_sqlite_main_and_shm_without_wal(tmp_path):
     entries = by_main(verify(str(tmp_path)))
     assert entries["real.db"]["integrity"] == "ok"
     assert entries["real.db"]["tables"] == {"items": 2}
-    assert "wal" not in entries["real.db"]
+    # the -shm is there without a -wal: SQLite never leaves that pair, so the -wal was lost
+    assert entries["real.db"]["wal"].startswith("missing: real.db-wal is absent")
     assert entries["walonly.db"]["tables"] == {"items": 2}
     assert entries["walonly.db"]["wal"] == "empty"
 
@@ -809,6 +810,33 @@ def test_dangling_shm_link_does_not_fail_its_family(tmp_path, capsys, live_wal_d
     assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL + LIVE_ROWS_IN_WAL}
     assert "a -shm holds no data" in err
     assert code == 0
+
+
+def test_a_shm_without_its_wal_fails_instead_of_passing_on_the_main_file(
+    tmp_path, capsys, live_wal_db
+):
+    """An interrupted copy that got the -shm but not the -wal loses every row the -wal held.
+
+    SQLite never leaves a -shm without a -wal, so the -shm proves the -wal was there. The
+    main file alone still passes integrity_check, which is exactly why it must not exit 0.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    # cp order: main, then -shm, then the -wal that never arrives
+    shutil.copyfile(live_wal_db, root / "app.db")
+    shutil.copyfile(str(live_wal_db) + "-shm", root / "app.db-shm")
+    code, out, err = run_cli(capsys, "verify", str(root), "--json")
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"
+    assert entry["sidecars"] == ["app.db-shm"]
+    assert entry["integrity"] == "ok"
+    # the late rows live only in the -wal: the copy reads clean and short
+    assert entry["tables"] == {"events": LIVE_ROWS_COMMITTED_BEFORE_WAL}
+    assert entry["wal"] == (
+        "missing: app.db-wal is absent although its -shm is present, "
+        "so the -wal was lost in the copy"
+    )
+    assert code == 1
 
 
 @pytest.mark.skipif(

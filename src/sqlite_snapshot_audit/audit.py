@@ -45,6 +45,8 @@ LINK_NOTE = {
 NOT_CHECKED = "not-checked: "
 # wal/shm prefix for a unit whose sidecar could not be read from the audited tree
 UNREADABLE = "unreadable: "
+# wal prefix for a unit whose -shm is present without the -wal that must have existed with it
+MISSING = "missing: "
 COPY_CHUNK_SIZE = 1024 * 1024
 
 # https://www.sqlite.org/fileformat.html#the_write_ahead_log
@@ -91,6 +93,19 @@ def _carries_no_data(rel: str) -> bool:
     """True for a ``-shm`` sidecar: a wal-index SQLite rebuilds, holding no rows of its own."""
     name = os.path.basename(rel)
     return name.endswith("-shm") and len(name) > len("-shm")
+
+
+def _shm_without_wal(sidecars: list[str]) -> bool:
+    """True for a unit that has a ``-shm`` but no ``-wal``.
+
+    SQLite never leaves that pair behind: a clean close deletes both, a live database
+    has both, and ``wal_checkpoint(TRUNCATE)`` leaves a 0-byte ``-wal`` that is still
+    there. A lone ``-shm`` therefore proves a ``-wal`` existed beside it and did not
+    reach this copy, taking every transaction that lived only in it.
+    """
+    return any(_carries_no_data(rel) for rel in sidecars) and not any(
+        rel.endswith("-wal") for rel in sidecars
+    )
 
 
 def _warn_skipped(warnings: list[str], message: str, rel: str) -> None:
@@ -586,9 +601,10 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
     reason on the tool's side, ``integrity`` is ``"not-checked: <error>"``. Checked
     entries with a -wal sidecar also gain ``wal`` (see _check_wal); so do units whose
     ``-wal`` is a link that is not followed or cannot be read, since neither is copied
-    and what it holds is therefore unknown. A ``-shm`` in that state gains ``shm``
-    instead and a warning: it holds no data of its own, SQLite rebuilds it from the
-    ``-wal``, so the unit is checked as usual and still passes.
+    and what it holds is therefore unknown, and units that have a ``-shm`` but no
+    ``-wal`` at all (see _shm_without_wal). A ``-shm`` that could not be copied gains
+    ``shm`` instead and a warning: it holds no data of its own, SQLite rebuilds it from
+    the ``-wal``, so the unit is checked as usual and still passes.
     """
     if warnings is None:
         warnings = Warnings()
@@ -652,6 +668,13 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
                     wal = _check_wal(os.path.join(tmp, os.path.basename(wals[0])), copy)
                 except OSError as exc:
                     wal = NOT_CHECKED + str(exc)
+            elif _shm_without_wal(entry["sidecars"]):
+                # the main file alone verifies fine, which is exactly the trap: it is missing
+                # every row the -wal held, and nothing else in the unit can show that
+                wal = MISSING + (
+                    f"{os.path.basename(entry['main'])}-wal is absent although its -shm is "
+                    "present, so the -wal was lost in the copy"
+                )
             entry["integrity"], entry["tables"] = _check_copy(copy)
             if wal is not None:
                 entry["wal"] = wal
@@ -679,8 +702,9 @@ def has_problems(entries: list[dict]) -> bool:
             return True
         wal = entry.get("wal", "")
         if wal and not (wal == "empty" or wal.startswith(("ok", NOT_CHECKED))):
-            # "invalid:", "symlink-outside", "symlink-dangling", "unreadable:": the -wal that
-            # would be replayed is either unsound or was never seen at all. A -shm in the same
-            # state is in "shm" instead and does not land here: it holds no data to lose.
+            # "invalid:", "symlink-outside", "symlink-dangling", "unreadable:", "missing:":
+            # the -wal that would be replayed is either unsound, was never seen at all, or is
+            # not in the copy although the -shm beside it proves it existed. A -shm that could
+            # not be copied is in "shm" instead and does not land here: it holds no data.
             return True
     return False

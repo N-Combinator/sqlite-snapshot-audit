@@ -133,7 +133,7 @@ fails on the tool's side — the temporary directory is missing, full (`ENOSPC`)
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
 `verify` exits 2.
 
-Entries whose unit includes a `-wal` sidecar also gain a `wal` key. SQLite silently ignores `-wal` content it
+Entries whose unit includes a `-wal` sidecar — or a `-shm` that arrived without one — also gain a `wal` key. SQLite silently ignores `-wal` content it
 cannot replay — the database then passes `integrity_check` while the transactions in the `-wal` are lost — so
 `verify` reads the copied `-wal` itself, repeating the checks SQLite's recovery makes: the header, then each
 frame's salt and its link in the running checksum chain, up to the last commit frame:
@@ -148,12 +148,13 @@ frame's salt and its link in the running checksum chain, up to the last commit f
 | `"invalid: <N> of <M> frames will be replayed (<reason>; dropped frame <K> is a commit frame, so a committed transaction is lost)"` | the dropped frames are not an uncommitted tail: frame `K` past the break commits a transaction that was written in full, so the restore silently loses it (and everything committed after it) |
 | `"symlink-outside"` / `"symlink-dangling"` | the unit's `-wal` is a symbolic link leading out of the audited directory, or nowhere: it is not followed, so the unit could not be copied as it stands and what its `-wal` holds is unknown |
 | `"unreadable: <path>: <error>"` | the unit's `-wal` could not be read from the audited tree (permissions, IO error): it is not copied either, so again the unit is not the one that would be restored |
+| `"missing: <name>-wal is absent although its -shm is present, so the -wal was lost in the copy"` | the unit has a `-shm` and no `-wal` at all. SQLite never leaves that pair behind — a clean close deletes both, a live database has both, and `wal_checkpoint(TRUNCATE)` leaves a 0-byte `-wal` that is still there — so the `-shm` proves a `-wal` stood beside it and did not reach the backup, taking every transaction that lived only in it |
 
 `M` counts the frames the `-wal` really holds, from the first one to the last of its generation — not just the
 frames up to the break. A frame the file cuts short counts as one; frames carrying an older generation’s salts
 do not count at all, as they were checkpointed into the database long ago.
 
-An `invalid`, `symlink-outside`, `symlink-dangling` or `unreadable` `wal` makes `verify` exit 1 even when
+An `invalid`, `symlink-outside`, `symlink-dangling`, `unreadable` or `missing` `wal` makes `verify` exit 1 even when
 `integrity` is `ok`; an `ok` one never does, however many frames its tail drops — discarding an uncommitted
 tail *is* SQLite’s crash recovery, and no transaction that was ever reported committed is lost. The frame accounting is reported either way, so a caller
 that wants to know how much of a `-wal` survived the copy can read it. These checks catch garbage, truncated,
@@ -168,7 +169,9 @@ permissions deny reading it — is reported in a separate `shm` key (`"symlink-o
 `"symlink-dangling"` or `"unreadable: <path>: <error>"`) and as a warning on stderr, but it does **not**
 fail the unit and does not stop the `-wal` from being checked: a `-shm` is a wal-index that SQLite rebuilds
 from the `-wal`, so it holds no row that the copy could lose. Its unit is copied and checked as usual,
-row counts included, and `verify` can still exit 0.
+row counts included, and `verify` can still exit 0. A `-shm` that is *present and readable* next to a database
+with no `-wal` at all is the opposite case and fails the unit — see the `missing` row above: there the `-shm`
+is the evidence that a `-wal` was left behind.
 
 A table whose rows cannot be counted (corrupt pages, unavailable virtual-table module) is reported with a count
 of `null`. `orphan-sidecar` and `not-sqlite` entries (including the links that were not followed) are reported
@@ -179,7 +182,7 @@ unchanged, without `integrity`/`tables`/`wal`.
 | class            | meaning                                                                                              | `main` is                         |
 |------------------|------------------------------------------------------------------------------------------------------|-----------------------------------|
 | `standalone`     | SQLite database with no `-wal`/`-shm` sidecars                                                       | the database                      |
-| `wal-family`     | SQLite database with its `-wal` (`-shm` optional; a lone `-shm` next to a database is also grouped here) | the database                      |
+| `wal-family`     | SQLite database with its `-wal` (`-shm` optional; a lone `-shm` next to a database is also grouped here, and fails `verify` — its `-wal` is missing) | the database                      |
 | `orphan-sidecar` | a `-wal` and/or `-shm` whose main file is missing or is not SQLite                                   | the expected (missing) main path  |
 | `not-sqlite`     | a file named `*.db`, `*.sqlite` or `*.sqlite3` (any case) without the SQLite header, including empty files | the file                          |
 
@@ -202,7 +205,7 @@ file named exactly `-wal` or `-shm` has no main file name in front of the suffix
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
 | 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | the whole tree was audited, every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries |
-| 1    | —                                  | any path could not be audited (unreadable file or directory, unfollowed link, symlinked directory leading out of the tree; a `-shm` does not count), any `orphan-sidecar` or `not-sqlite` entry (including one with a `"skipped"` key), any integrity other than `ok`, or any `invalid`/`symlink-outside`/`symlink-dangling`/`unreadable` `wal` (all entries are still printed) |
+| 1    | —                                  | any path could not be audited (unreadable file or directory, unfollowed link, symlinked directory leading out of the tree; a `-shm` does not count), any `orphan-sidecar` or `not-sqlite` entry (including one with a `"skipped"` key), any integrity other than `ok`, or any `invalid`/`symlink-outside`/`symlink-dangling`/`unreadable`/`missing` `wal` (all entries are still printed) |
 | 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
