@@ -142,9 +142,9 @@ frame's salt and its link in the running checksum chain, up to the last commit f
 |-------------------------|--------------------------------------------------------------------------------------------|
 | `"empty"`               | the `-wal` is 0 bytes (nothing to replay)                                                  |
 | `"ok (<N> frames)"`     | every frame of this WAL generation is replayed; `N` is SQLite’s `mxFrame`. Frames after them carry an older generation’s salt and are ignored by SQLite, as they are here |
-| `"ok (<N> frames; <M> further frames will be dropped, as SQLite does: <reason>)"` | the `-wal` ends after its last commit frame in a tail SQLite discards on recovery — an uncommitted transaction, a frame the copy caught half-written, or a frame whose checksum does not chain. Normal for any `cp`/rsync of a live WAL database: the `N` replayed frames hold every committed transaction, so this is **not** a failure |
+| `"ok (<N> frames; <M> further frames will be dropped, as SQLite does: <reason>)"` | the `-wal` ends after its last commit frame in a tail SQLite discards on recovery — an uncommitted transaction, a frame the copy caught half-written, or a frame whose checksum does not chain. Normal for any `cp`/rsync of a live WAL database: the `N` replayed frames hold every committed transaction, so this is **not** a failure. `N` is 0 when the whole generation is one transaction that never committed (a copy taken after a checkpoint-restart, while a long write was in flight) — SQLite replays nothing there either, and nothing committed was lost |
 | `"invalid: <reason>"`   | the header is unusable, so SQLite throws the whole `-wal` away — truncated, wrong magic number (`0x377f0682`/`0x377f0683`) or format version (3007000), failing checksum, a page size different from the database’s (header bytes 16–17), or a first frame whose salt differs from the header’s |
-| `"invalid: 0 of <M> frames will be replayed (<reason>)"` | the header is fine but not one frame is replayed — the `-wal` holds frames and every one of them is lost, leaving only the main file |
+| `"invalid: 0 of <M> frames will be replayed (<reason>)"` | the header is fine, but a frame does not decode — torn or failing its checksum — and nothing at all is replayed: the `-wal` holds frames, every one of them is lost, and the break can hide a commit the main file does not have |
 | `"invalid: <N> of <M> frames will be replayed (<reason>; dropped frame <K> is a commit frame, so a committed transaction is lost)"` | the dropped frames are not an uncommitted tail: frame `K` past the break commits a transaction that was written in full, so the restore silently loses it (and everything committed after it) |
 | `"symlink-outside"` / `"symlink-dangling"` | the unit's `-wal` is a symbolic link leading out of the audited directory, or nowhere: it is not followed, so the unit could not be copied as it stands and what its `-wal` holds is unknown |
 | `"unreadable: <path>: <error>"` | the unit's `-wal` could not be read from the audited tree (permissions, IO error): it is not copied either, so again the unit is not the one that would be restored |
@@ -155,8 +155,9 @@ frames up to the break. A frame the file cuts short counts as one; frames carryi
 do not count at all, as they were checkpointed into the database long ago.
 
 An `invalid`, `symlink-outside`, `symlink-dangling`, `unreadable` or `missing` `wal` makes `verify` exit 1 even when
-`integrity` is `ok`; an `ok` one never does, however many frames its tail drops — discarding an uncommitted
-tail *is* SQLite’s crash recovery, and no transaction that was ever reported committed is lost. The frame accounting is reported either way, so a caller
+`integrity` is `ok`; an `ok` one never does, however many frames its tail drops — even when the tail is the
+whole `-wal` — because discarding an uncommitted tail *is* SQLite’s crash recovery, and no transaction that
+was ever reported committed is lost. The frame accounting is reported either way, so a caller
 that wants to know how much of a `-wal` survived the copy can read it. These checks catch garbage, truncated,
 damaged, half-written and mismatched `-wal` files, but not a complete, self-consistent `-wal` of a *different*
 database with the same page size: nothing in the WAL format ties a `-wal` to its database, and SQLite would

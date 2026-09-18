@@ -1345,6 +1345,46 @@ def test_wal_without_a_final_commit_frame_is_ok_up_to_the_last_commit(tmp_path, 
     assert code == 0
 
 
+def test_wal_generation_without_any_commit_frame_is_ok(tmp_path, capsys):
+    """A -wal whose whole generation never commits: SQLite replays nothing and loses nothing.
+
+    That is the state of a copy of a live database whose -wal was restarted and whose next
+    write transaction is still in flight -- the main file already holds every committed row.
+    """
+    src, tree = tmp_path / "live", tmp_path / "tree"
+    src.mkdir()
+    tree.mkdir()
+    conn = sqlite3.connect(src / "app.db")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("committed",)] * 200)
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # the 200 rows are in the main file now
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("in flight",)] * 500)
+        conn.commit()
+        shutil.copyfile(src / "app.db", tree / "app.db")
+        wal = tree / "app.db-wal"
+        # drop the only commit frame of the only transaction in this generation
+        shutil.copyfile(str(src / "app.db") + "-wal", wal)
+        wal.write_bytes(wal.read_bytes()[: -(24 + 4096)])
+    finally:
+        conn.close()
+    frames = wal_frames(wal)
+    assert frames >= 1
+    assert [commits for _, commits in wal_generation(wal)] == [False] * frames
+    assert sqlite_replay_count(tree / "app.db", wal) == 0
+    code, entry = verify_wal(capsys, tree)
+    assert entry["wal"] == (
+        f"ok (0 frames; {frames} further frames will be dropped, "
+        "as SQLite does: they were never committed)"
+    )
+    assert entry["integrity"] == "ok"
+    assert entry["tables"] == {"events": 200}  # every committed row is in the main file
+    assert code == 0
+
+
 def test_wal_with_a_torn_tail_after_a_commit_is_ok(tmp_path, capsys):
     """A cp of a live WAL database ends mid-frame; the committed prefix still restores."""
     src, tree = tmp_path / "live", tmp_path / "tree"

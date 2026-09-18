@@ -471,11 +471,12 @@ def _check_wal(wal_path: str, db_path: str) -> str:
     checksum chain, and only up to the last commit frame is replayed.
 
     Returns "empty", "ok (<N> frames)" with N the number of frames SQLite would replay,
-    or "invalid: <reason>" when SQLite would replay nothing at all. Frames past the last
-    commit frame (the torn or uncommitted tail every copy of a live WAL database has) are
-    reported in the "ok" value: dropping them is SQLite's crash recovery, not data loss --
-    unless one of the dropped frames is itself a commit frame, in which case a transaction
-    that was fully written is being thrown away and the -wal is reported as invalid.
+    or "invalid: <reason>". Frames past the last commit frame (the uncommitted tail every
+    copy of a live WAL database has) are reported in the "ok" value, even when they are
+    the whole generation and N is 0: dropping them is SQLite's crash recovery, not data
+    loss. A frame that does not decode at all is different -- it can hide a commit the
+    main file does not have -- so it is "invalid" when it leaves nothing to replay, or
+    when one of the frames it drops is itself a complete commit frame.
     """
     wal_size = os.path.getsize(wal_path)
     if wal_size == 0:
@@ -525,20 +526,25 @@ def _check_wal(wal_path: str, db_path: str) -> str:
             good = number
             if truncate:
                 replayed = good
-        if broken is not None:
-            number, reason = broken
-            # the frames after the break are dropped too, and they are usually the bulk of it
-            tail, commit = _wal_generation_tail(f, number, frame_size, header[16:24])
-            present, dropped_because = number - 1 + tail, reason
-        elif replayed < good:
-            present, commit = good, None
-            reason = "the last transaction has no commit frame"
-            dropped_because = "they were never committed"
-        else:
-            return f"ok ({replayed} frames)"
+        if broken is None:
+            if replayed == good:
+                return f"ok ({replayed} frames)"
+            # Every frame decoded; the generation just ends inside a transaction that was
+            # never committed, which is the ordinary state of a copy of a live database.
+            # SQLite drops exactly those frames, so nothing durable is lost -- not even
+            # when there is no commit frame at all and the replayed prefix is empty.
+            return (
+                f"ok ({replayed} frames; {good - replayed} further frames will be dropped, "
+                "as SQLite does: they were never committed)"
+            )
+        number, reason = broken
+        # the frames after the break are dropped too, and they are usually the bulk of it
+        tail, commit = _wal_generation_tail(f, number, frame_size, header[16:24])
+        present = number - 1 + tail
     if replayed == 0:
-        # nothing is replayed: everything the -wal holds is lost and the copy is only
-        # the main file, which is what makes this worth failing on
+        # a frame is unusable and nothing is replayed: everything the -wal holds is lost,
+        # the copy is only the main file, and the break can hide a commit the main file
+        # does not have -- which is what makes this worth failing on
         return f"invalid: 0 of {present} frames will be replayed ({reason})"
     if commit is not None:
         # the dropped frames are not the uncommitted tail of a live copy: one of them
@@ -551,7 +557,7 @@ def _check_wal(wal_path: str, db_path: str) -> str:
     # is exactly what SQLite does after a crash; no committed transaction is lost.
     return (
         f"ok ({replayed} frames; {present - replayed} further frames will be dropped, "
-        f"as SQLite does: {dropped_because})"
+        f"as SQLite does: {reason})"
     )
 
 
