@@ -1765,3 +1765,54 @@ def test_database_missing_a_whole_page_is_not_ok(tmp_path, capsys):
         f"({size // 4096} pages of 4096): 1 page(s) are missing from the end"
     )
     assert code == 1
+
+
+def test_truncated_wal_fails_the_units_integrity_not_only_its_wal_key(tmp_path, capsys):
+    """A -wal cut mid-frame takes the unit down with it: the main file alone reads "ok"."""
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    frames = wal_frames(wal)
+    truncate(wal, wal.stat().st_size - 10)
+    # the rows of the lost frames live nowhere else, yet the database beside it is healthy
+    assert integrity_check(main_path) == [("ok",)]
+    assert sqlite_replay_count(main_path, wal) == 0
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["integrity"] == (
+        f"truncated: -wal is {wal.stat().st_size} bytes: 0 whole frames of {24 + 4096} bytes "
+        f"plus {24 + 4096 - 10} bytes of an incomplete one, and what it holds can no longer "
+        "be replayed in full onto the database beside it"
+    )
+    assert entry["wal"] == (
+        f"invalid: 0 of {frames} frames will be replayed "
+        f"(frame {frames} stops after {24 + 4096 - 10} of {24 + 4096} bytes)"
+    )
+    assert code == 1
+
+
+@pytest.mark.parametrize("page_size", [512, 1024, 4096, 65536])
+def test_whole_database_of_any_page_size_is_still_ok(tmp_path, capsys, page_size):
+    """Criterion 4: the length check must not fire on a database that is all there."""
+    conn = sqlite3.connect(tmp_path / "a.db")
+    conn.execute(f"PRAGMA page_size={page_size}")
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT)")
+    conn.executemany("INSERT INTO items (body) VALUES (?)", [("x" * 200,)] * 200)
+    conn.commit()
+    conn.close()
+    assert os.path.getsize(tmp_path / "a.db") % page_size == 0
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert (entry["integrity"], entry["tables"]) == ("ok", {"items": 200})
+    assert code == 0
+
+
+def test_whole_database_with_a_legacy_header_is_not_called_truncated(tmp_path, capsys):
+    """A pre-3.7.0 writer left the header page count at 0; the file's own length rules."""
+    make_db(tmp_path / "legacy.db", rows=300)
+    with open(tmp_path / "legacy.db", "r+b") as f:
+        f.seek(28)
+        f.write(bytes(4))  # in-header database size: not maintained by that library
+        f.seek(92)
+        f.write(bytes(4))  # version-valid-for != the change counter, so the 0 is not a claim
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert (entry["integrity"], entry["tables"]) == ("ok", {"items": 300})
+    assert code == 0
