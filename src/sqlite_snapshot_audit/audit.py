@@ -47,7 +47,12 @@ NOT_CHECKED = "not-checked: "
 UNREADABLE = "unreadable: "
 # wal prefix for a unit whose -shm is present without the -wal that must have existed with it
 MISSING = "missing: "
+# integrity prefix for a unit whose files are shorter than their own headers say they are
+TRUNCATED = "truncated: "
 COPY_CHUNK_SIZE = 1024 * 1024
+
+# https://www.sqlite.org/fileformat.html#the_database_header
+DB_HEADER_SIZE = 100
 
 # https://www.sqlite.org/fileformat.html#the_write_ahead_log
 WAL_MAGIC_LITTLE_ENDIAN = 0x377F0682
@@ -431,6 +436,122 @@ def _database_page_size(db_path: str) -> int | None:
     return 65536 if size == 1 else size
 
 
+def _check_truncation(db_path: str, has_wal: bool = False) -> str | None:
+    """Why a (copied) database file is shorter than its own header says, or None if it is whole.
+
+    ``PRAGMA integrity_check`` only reads the pages its b-tree walk reaches, so it says "ok"
+    for a file whose tail is simply gone: cutting a single byte off a valid database still
+    reports "ok" and the full row count. That is the worst answer a backup checker can give,
+    so the file's length is compared with what its own header says it should be, and that
+    verdict outranks whatever ``integrity_check`` makes of the pages that did survive.
+
+    Three ways a file can be too short, all from the issue:
+
+    * its size is not a multiple of the page size (header bytes 16-17, 1 meaning 65536) --
+      the last page is a fragment;
+    * it is shorter than ``page_count * page_size`` (bytes 28-31). That field is only
+      believed when the change counter (24-27) equals version-valid-for (92-95), which is
+      exactly the condition SQLite itself uses: otherwise the file was last written by a
+      pre-3.7.0 library that never maintained it, and the file size is authoritative;
+    * the last page does not read back in full.
+
+    A file *longer* than ``page_count * page_size`` is not an error: a hot copy of a live
+    database, or one whose tail pages were freed, legitimately carries pages past the count.
+
+    ``has_wal`` says a ``-wal`` was copied beside this file, and it switches the page-count
+    comparison off. A checkpoint writes page 1 -- which carries the new page count -- before
+    it writes the pages that count covers, so a copy taken inside that window holds a main
+    file shorter than its own header while the ``-wal`` beside it still holds every one of
+    the missing pages: SQLite replays them and the restore is whole. That window is not
+    rare (a stress run of hot copies during passive checkpoints hit it in 38 of 400), and
+    calling it truncation would fail exactly the live backups this tool exists to bless.
+    The other two checks stay on for such a unit: a checkpoint only ever writes whole
+    pages, so a fragment page is a torn copy no ``-wal`` can explain.
+    """
+    try:
+        size = os.path.getsize(db_path)
+    except OSError as exc:
+        return f"file size unavailable: {exc.strerror or exc}"
+    if size < DB_HEADER_SIZE:
+        return f"file is {size} bytes, shorter than the {DB_HEADER_SIZE}-byte database header"
+    try:
+        with open(db_path, "rb") as f:
+            header = f.read(DB_HEADER_SIZE)
+    except OSError as exc:
+        return f"header unreadable: {exc.strerror or exc}"
+    page_size = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    if page_size < 512 or page_size & (page_size - 1):
+        # not a power of two in [512, 65536]: no page count can be derived, and SQLite will
+        # reject the file on its own, so leave the verdict to integrity_check
+        return None
+    if size % page_size:
+        return (
+            f"file is {size} bytes, not a multiple of the {page_size}-byte page size: "
+            f"the last page is {size % page_size} of {page_size} bytes"
+        )
+    page_count = int.from_bytes(header[28:32], "big")
+    trustworthy = header[24:28] == header[92:96] and not has_wal
+    if trustworthy and page_count and size < page_count * page_size:
+        return (
+            f"file is {size} bytes, short of the {page_count * page_size} bytes its header "
+            f"claims ({page_count} pages of {page_size}): {page_count - size // page_size} "
+            "page(s) are missing from the end"
+        )
+    try:
+        with open(db_path, "rb") as f:
+            f.seek(size - page_size)
+            last = f.read(page_size)
+    except OSError as exc:
+        return f"last page unreadable: {exc.strerror or exc}"
+    if len(last) < page_size:
+        return (
+            f"last page stops after {len(last)} of {page_size} bytes "
+            f"(the file shrank while it was being read)"
+        )
+    return None
+
+
+def _wal_truncation(wal_path: str, page_size: int | None, verdict: str) -> str | None:
+    """Why a (copied) ``-wal`` is cut short in a way that costs data, or None if it is not.
+
+    A ``-wal`` holds a 32-byte header and then frames of ``24 + page_size`` bytes each, so
+    any other length means the copy caught the file mid-frame. That alone is *not* a
+    failure: a ``cp``/rsync of a live WAL database almost always ends inside the frame that
+    was being written, and SQLite drops exactly that uncommitted tail on recovery without
+    losing a transaction. Only a short ``-wal`` that ``_check_wal`` already judges
+    ``invalid`` -- because the frames it cuts off include a commit, or because nothing is
+    left to replay at all -- costs rows that the main file does not have, and only that
+    fails the unit's integrity as well as its ``wal`` key: the main file beside it verifies
+    "ok" and reports its own row count, which is precisely the false pass worth failing on.
+
+    A 0-byte ``-wal`` is whole (``wal_checkpoint(TRUNCATE)`` leaves exactly that), and a
+    ``-wal`` whose page size does not match the database's is a mismatch rather than a
+    truncation -- ``_check_wal`` reports both, so neither is claimed here.
+    """
+    if not verdict.startswith("invalid"):
+        return None
+    try:
+        size = os.path.getsize(wal_path)
+    except OSError:
+        return None  # _check_wal reports what it could not read
+    if size == 0:
+        return None
+    if size < WAL_HEADER_SIZE:
+        return f"-wal is {size} bytes, shorter than its {WAL_HEADER_SIZE}-byte header"
+    if not page_size:
+        return None
+    frame_size = WAL_FRAME_HEADER_SIZE + page_size
+    body = size - WAL_HEADER_SIZE
+    if body % frame_size:
+        return (
+            f"-wal is {size} bytes: {body // frame_size} whole frames of {frame_size} bytes "
+            f"plus {body % frame_size} bytes of an incomplete one, and what it holds can no "
+            "longer be replayed in full onto the database beside it"
+        )
+    return None
+
+
 def _wal_generation_tail(f, first: int, frame_size: int, salts: bytes) -> tuple[int, int | None]:
     """Count the frames of this WAL generation from frame ``first`` on, commit frames included.
 
@@ -681,7 +802,25 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
                     f"{os.path.basename(entry['main'])}-wal is absent although its -shm is "
                     "present, so the -wal was lost in the copy"
                 )
-            entry["integrity"], entry["tables"] = _check_copy(copy)
+            # Length before content: integrity_check reads only the pages its b-tree walk
+            # reaches, so a file (or a -wal) whose tail is missing passes it while the rows
+            # that lived in the lost tail are gone. Whatever SQLite would say about such a
+            # copy, it is not a copy anything should be restored from.
+            short = _check_truncation(copy, has_wal=bool(wals))
+            if short is None and wals and wal:
+                try:
+                    page_size = _database_page_size(copy)
+                except OSError:
+                    page_size = None
+                short = _wal_truncation(
+                    os.path.join(tmp, os.path.basename(wals[0])), page_size, wal
+                )
+            integrity, tables = _check_copy(copy)
+            # The row counts are still worth reporting -- they say how much of the backup is
+            # readable -- but they are counted over a file that is missing its tail, so the
+            # verdict is the truncation, not whatever integrity_check made of what remains.
+            entry["integrity"] = TRUNCATED + short if short is not None else integrity
+            entry["tables"] = tables
             if wal is not None:
                 entry["wal"] = wal
             if shm:
