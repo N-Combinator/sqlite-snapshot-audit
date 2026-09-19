@@ -107,9 +107,10 @@ sqlite-snapshot-audit verify /backups/2026-09-17 --json
 Runs `scan`, then for each `standalone` or `wal-family` entry:
 
 1. copies the main file **and its sidecars together** into a fresh temporary directory,
-2. opens the copy with `sqlite3.connect("file:<copy>?mode=ro", uri=True)` and runs `PRAGMA integrity_check`,
-3. counts the rows of every table in the copy (so rows still sitting in an uncheckpointed `-wal` are included),
-4. deletes the temporary copy.
+2. compares the copy's length with what its own header says that length should be,
+3. opens the copy with `sqlite3.connect("file:<copy>?mode=ro", uri=True)` and runs `PRAGMA integrity_check`,
+4. counts the rows of every table in the copy (so rows still sitting in an uncheckpointed `-wal` are included),
+5. deletes the temporary copy.
 
 Those entries gain two keys:
 
@@ -132,6 +133,45 @@ sidecars cannot be read, the main file is still checked and `wal` (or, for a `-s
 fails on the tool's side — the temporary directory is missing, full (`ENOSPC`), over quota (`EDQUOT`) or not
 writable (`EACCES`) — nothing is known about the backup, so `integrity` is `"not-checked: <error>"` and
 `verify` exits 2.
+
+### A copy that is shorter than its header says
+
+`PRAGMA integrity_check` only reads the pages its b-tree walk reaches, so a database whose tail is simply
+gone still answers `"ok"` and still hands back every row it was ever asked for: cutting a **single byte** off
+a valid file is enough. For a backup checker that is the worst answer available, so the copy is measured
+against its own header before SQLite is opened on it, and `integrity` is `"truncated: <reason>"` — a value
+other than `"ok"`, so `verify` exits 1 — when any of these holds:
+
+* the file is shorter than the 100-byte database header;
+* its size is not a multiple of the page size (header bytes 16–17, `1` meaning 65536): the last page is a
+  fragment;
+* it is shorter than `page_count * page_size` (header bytes 28–31);
+* its last page does not read back in full.
+
+`tables` is still reported — the row counts say how much of the backup reads back — but they are counted over
+a file that is missing its tail, so the verdict is the truncation and not whatever `integrity_check` made of
+the pages that survived.
+
+A `-wal` is measured the same way: it holds a 32-byte header and then frames of `24 + page_size` bytes, so any
+other length means the copy caught it mid-frame. That alone is **not** a failure — a `cp` of a live WAL
+database almost always ends inside the frame being written, and SQLite drops exactly that tail without losing
+a transaction (see the `wal` table below). Only a short `-wal` that is already `invalid` costs rows the main
+file does not have, and only that makes the unit's `integrity` `"truncated: ..."` as well as its `wal`.
+
+Two claims in the header are deliberately not made:
+
+* a file **longer** than `page_count * page_size` is not an error — a hot copy, or one whose tail pages were
+  freed, legitimately carries pages past the count;
+* `page_count` is only believed when the change counter (bytes 24–27) equals version-valid-for (bytes 92–95),
+  which is SQLite's own rule for trusting that field, and the claim is dropped when the `-wal` beside the file
+  **really holds every missing page**: a checkpoint writes page 1 — carrying the new page count — before the
+  pages that count covers, so a copy taken inside that window has a main file shorter than its own header while
+  the `-wal` still restores all of the gap, and SQLite puts the database back together. The test of that is the
+  page numbers of the frames the `-wal` will replay (those up to its last commit frame; the uncommitted tail
+  restores nothing), not the mere presence of a `-wal` — a `-wal` carrying one frame for page 4 does not bring
+  back pages 17–36, and the verdict then says so: `… 20 page(s) are missing from the end, and the -wal beside
+  it restores none of them`. The other two checks stay on whatever the `-wal` holds; a checkpoint only ever
+  writes whole pages, so a fragment page is a torn copy no `-wal` can explain.
 
 Entries whose unit includes a `-wal` sidecar — or a `-shm` that arrived without one — also gain a `wal` key. SQLite silently ignores `-wal` content it
 cannot replay — the database then passes `integrity_check` while the transactions in the `-wal` are lost — so
@@ -206,7 +246,7 @@ file named exactly `-wal` or `-shm` has no main file name in front of the suffix
 | code | `scan`                             | `verify`                                                                                  |
 |------|------------------------------------|-------------------------------------------------------------------------------------------|
 | 0    | tree scanned (unreadable paths and symlinked directories warned about on stderr) | the whole tree was audited, every `standalone`/`wal-family` entry has `integrity: "ok"` and a `wal` that is `empty` or `ok (…)` (including one with a dropped uncommitted tail), and there are no `orphan-sidecar`/`not-sqlite` entries |
-| 1    | —                                  | any path could not be audited (unreadable file or directory, unfollowed link, symlinked directory leading out of the tree; a `-shm` does not count), any `orphan-sidecar` or `not-sqlite` entry (including one with a `"skipped"` key), any integrity other than `ok`, or any `invalid`/`symlink-outside`/`symlink-dangling`/`unreadable`/`missing` `wal` (all entries are still printed) |
+| 1    | —                                  | any path could not be audited (unreadable file or directory, unfollowed link, symlinked directory leading out of the tree; a `-shm` does not count), any `orphan-sidecar` or `not-sqlite` entry (including one with a `"skipped"` key), any integrity other than `ok` (a `truncated: …` copy included), or any `invalid`/`symlink-outside`/`symlink-dangling`/`unreadable`/`missing` `wal` (all entries are still printed) |
 | 2    | usage or IO error: `<dir>` does not exist or cannot be read | same; also when `TMPDIR` is inside `<dir>`, or when any unit (or its `wal`) is `not-checked` because its temporary copy failed (all entries are still printed; takes precedence over 1) |
 
 ## Similar tools
