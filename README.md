@@ -163,11 +163,15 @@ Two claims in the header are deliberately not made:
 * a file **longer** than `page_count * page_size` is not an error — a hot copy, or one whose tail pages were
   freed, legitimately carries pages past the count;
 * `page_count` is only believed when the change counter (bytes 24–27) equals version-valid-for (bytes 92–95),
-  which is SQLite's own rule for trusting that field, and never for a unit that was copied **with a `-wal`**: a
-  checkpoint writes page 1 — carrying the new page count — before the pages that count covers, so a copy taken
-  inside that window holds a main file shorter than its own header while the `-wal` beside it still holds every
-  missing page. The other two checks stay on for such a unit; a checkpoint only ever writes whole pages, so a
-  fragment page is a torn copy no `-wal` can explain.
+  which is SQLite's own rule for trusting that field, and the claim is dropped when the `-wal` beside the file
+  **really holds every missing page**: a checkpoint writes page 1 — carrying the new page count — before the
+  pages that count covers, so a copy taken inside that window has a main file shorter than its own header while
+  the `-wal` still restores all of the gap, and SQLite puts the database back together. The test of that is the
+  page numbers of the frames the `-wal` will replay (those up to its last commit frame; the uncommitted tail
+  restores nothing), not the mere presence of a `-wal` — a `-wal` carrying one frame for page 4 does not bring
+  back pages 17–36, and the verdict then says so: `… 20 page(s) are missing from the end, and the -wal beside
+  it restores none of them`. The other two checks stay on whatever the `-wal` holds; a checkpoint only ever
+  writes whole pages, so a fragment page is a torn copy no `-wal` can explain.
 
 Entries whose unit includes a `-wal` sidecar — or a `-shm` that arrived without one — also gain a `wal` key. SQLite silently ignores `-wal` content it
 cannot replay — the database then passes `integrity_check` while the transactions in the `-wal` are lost — so

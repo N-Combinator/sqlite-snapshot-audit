@@ -22,6 +22,7 @@ import stat
 import struct
 import tempfile
 import urllib.parse
+from typing import NamedTuple
 
 SQLITE_HEADER = b"SQLite format 3\x00"
 SIDECAR_SUFFIXES = ("-wal", "-shm")
@@ -436,7 +437,7 @@ def _database_page_size(db_path: str) -> int | None:
     return 65536 if size == 1 else size
 
 
-def _check_truncation(db_path: str, has_wal: bool = False) -> str | None:
+def _check_truncation(db_path: str, wal_pages: frozenset[int] | None = None) -> str | None:
     """Why a (copied) database file is shorter than its own header says, or None if it is whole.
 
     ``PRAGMA integrity_check`` only reads the pages its b-tree walk reaches, so it says "ok"
@@ -458,15 +459,25 @@ def _check_truncation(db_path: str, has_wal: bool = False) -> str | None:
     A file *longer* than ``page_count * page_size`` is not an error: a hot copy of a live
     database, or one whose tail pages were freed, legitimately carries pages past the count.
 
-    ``has_wal`` says a ``-wal`` was copied beside this file, and it switches the page-count
-    comparison off. A checkpoint writes page 1 -- which carries the new page count -- before
-    it writes the pages that count covers, so a copy taken inside that window holds a main
-    file shorter than its own header while the ``-wal`` beside it still holds every one of
-    the missing pages: SQLite replays them and the restore is whole. That window is not
-    rare (a stress run of hot copies during passive checkpoints hit it in 38 of 400), and
-    calling it truncation would fail exactly the live backups this tool exists to bless.
-    The other two checks stay on for such a unit: a checkpoint only ever writes whole
-    pages, so a fragment page is a torn copy no ``-wal`` can explain.
+    ``wal_pages`` is the set of page numbers the ``-wal`` beside this file will actually
+    restore (the pages of the frames ``_check_wal`` counts as replayed), or None when no
+    ``-wal`` was read at all. It is what switches the page-count comparison off, and only
+    for the pages it really covers. A checkpoint writes page 1 -- which carries the new
+    page count -- before it writes the pages that count covers, so a copy taken inside that
+    window holds a main file shorter than its own header while the ``-wal`` beside it still
+    holds every one of the missing pages: SQLite replays them and the restore is whole.
+    That window is not rare (a stress run of hot copies during passive checkpoints hit it
+    in 38 of 400), and calling it truncation would fail exactly the live backups this tool
+    exists to bless. But the mere presence of a ``-wal`` proves none of that: a ``-wal``
+    holding one frame for page 4 does not bring back pages 17..36, and excusing the gap
+    because some ``-wal`` is there turns the commonest shape of a live backup -- main file
+    plus ``-wal`` -- into the one shape where a plainly truncated file passes. So the claim
+    is dropped only when every missing page number is in ``wal_pages``, which is exactly
+    the checkpoint window and nothing else. Frames past the last commit frame do not count:
+    SQLite drops them, so they restore nothing.
+
+    The other two checks stay on whatever the ``-wal`` holds: a checkpoint only ever writes
+    whole pages, so a fragment page is a torn copy no ``-wal`` can explain.
     """
     try:
         size = os.path.getsize(db_path)
@@ -491,13 +502,18 @@ def _check_truncation(db_path: str, has_wal: bool = False) -> str | None:
             f"the last page is {size % page_size} of {page_size} bytes"
         )
     page_count = int.from_bytes(header[28:32], "big")
-    trustworthy = header[24:28] == header[92:96] and not has_wal
-    if trustworthy and page_count and size < page_count * page_size:
-        return (
-            f"file is {size} bytes, short of the {page_count * page_size} bytes its header "
-            f"claims ({page_count} pages of {page_size}): {page_count - size // page_size} "
-            "page(s) are missing from the end"
-        )
+    # the page count is only believed when SQLite itself believes it (change counter ==
+    # version-valid-for); otherwise a pre-3.7.0 writer left it stale and it claims nothing
+    believed = header[24:28] == header[92:96]
+    if believed and page_count and size < page_count * page_size:
+        missing = frozenset(range(size // page_size + 1, page_count + 1))
+        restored = missing & wal_pages if wal_pages is not None else frozenset()
+        if missing - restored:
+            return (
+                f"file is {size} bytes, short of the {page_count * page_size} bytes its "
+                f"header claims ({page_count} pages of {page_size}): {len(missing)} page(s) "
+                f"are missing from the end{_wal_cover(wal_pages, restored)}"
+            )
     try:
         with open(db_path, "rb") as f:
             f.seek(size - page_size)
@@ -510,6 +526,15 @@ def _check_truncation(db_path: str, has_wal: bool = False) -> str | None:
             f"(the file shrank while it was being read)"
         )
     return None
+
+
+def _wal_cover(wal_pages: frozenset[int] | None, restored: frozenset[int]) -> str:
+    """How much of a truncation the -wal beside the file makes good, for the verdict's text."""
+    if wal_pages is None:
+        return ""
+    if not restored:
+        return ", and the -wal beside it restores none of them"
+    return f", and the -wal beside it restores only {len(restored)} of them"
 
 
 def _wal_truncation(wal_path: str, page_size: int | None, verdict: str) -> str | None:
@@ -583,7 +608,20 @@ def _wal_generation_tail(f, first: int, frame_size: int, salts: bytes) -> tuple[
     return count, commit
 
 
-def _check_wal(wal_path: str, db_path: str) -> str:
+class _Wal(NamedTuple):
+    """What _check_wal found: its verdict, and the pages the -wal really restores.
+
+    ``pages`` holds the page numbers of the frames SQLite would replay -- the prefix up to
+    the last commit frame -- so it is the only evidence that the -wal makes good a gap at
+    the end of the main file (see _check_truncation). It is empty whenever nothing is
+    replayed, including for a -wal whose whole generation is an uncommitted tail.
+    """
+
+    verdict: str
+    pages: frozenset[int]
+
+
+def _check_wal(wal_path: str, db_path: str) -> _Wal:
     """Check a (copied) -wal file the way SQLite's recovery reads it, which it does not report.
 
     SQLite silently ignores a -wal it cannot replay, so integrity_check says "ok" for a
@@ -591,37 +629,45 @@ def _check_wal(wal_path: str, db_path: str) -> str:
     walIndexRecover(): header, then each frame's salt and its link in the running
     checksum chain, and only up to the last commit frame is replayed.
 
-    Returns "empty", "ok (<N> frames)" with N the number of frames SQLite would replay,
-    or "invalid: <reason>". Frames past the last commit frame (the uncommitted tail every
+    Returns a _Wal: the verdict -- "empty", "ok (<N> frames)" with N the number of frames
+    SQLite would replay, or "invalid: <reason>" -- and the page numbers those N frames
+    carry, which is what a caller needs to know whether the -wal makes good a gap at the
+    end of the main file. Frames past the last commit frame (the uncommitted tail every
     copy of a live WAL database has) are reported in the "ok" value, even when they are
     the whole generation and N is 0: dropping them is SQLite's crash recovery, not data
     loss. A frame that does not decode at all is different -- it can hide a commit the
     main file does not have -- so it is "invalid" when it leaves nothing to replay, or
     when one of the frames it drops is itself a complete commit frame.
     """
+    nothing = frozenset()  # no frame is replayed, so the -wal restores no page
     wal_size = os.path.getsize(wal_path)
     if wal_size == 0:
-        return "empty"
+        return _Wal("empty", nothing)
     with open(wal_path, "rb") as f:
         header = f.read(WAL_HEADER_SIZE)
         if len(header) < WAL_HEADER_SIZE:
-            return f"invalid: header truncated to {len(header)} bytes"
+            return _Wal(f"invalid: header truncated to {len(header)} bytes", nothing)
         magic, version, page_size, _, salt1, salt2, cksum1, cksum2 = struct.unpack(">8I", header)
         if magic not in (WAL_MAGIC_LITTLE_ENDIAN, WAL_MAGIC_BIG_ENDIAN):
-            return f"invalid: bad magic number 0x{magic:08x}"
+            return _Wal(f"invalid: bad magic number 0x{magic:08x}", nothing)
         if version != WAL_VERSION:
-            return f"invalid: unsupported format version {version}"
+            return _Wal(f"invalid: unsupported format version {version}", nothing)
         if _wal_checksum(header[:24], magic == WAL_MAGIC_BIG_ENDIAN) != (cksum1, cksum2):
-            return "invalid: header checksum mismatch"
+            return _Wal("invalid: header checksum mismatch", nothing)
         db_page_size = _database_page_size(db_path)
         if page_size != db_page_size:
-            return f"invalid: page size {page_size} does not match database page size {db_page_size}"
+            return _Wal(
+                f"invalid: page size {page_size} does not match database page size "
+                f"{db_page_size}",
+                nothing,
+            )
         big_endian = magic == WAL_MAGIC_BIG_ENDIAN
         frame_size = WAL_FRAME_HEADER_SIZE + page_size
         checksum = (cksum1, cksum2)
         good = 0  # frames that decode; SQLite stops reading at the first one that does not
         replayed = 0  # SQLite's mxFrame: frames up to and including the last commit frame
         broken = None  # (number of the first unusable frame, why it is not usable)
+        pages: list[int] = []  # the page each decoded frame carries, in frame order
         f.seek(WAL_HEADER_SIZE)
         while f.tell() < wal_size:
             frame, number = f.read(frame_size), good + 1
@@ -633,7 +679,7 @@ def _check_wal(wal_path: str, db_path: str) -> str:
             )
             if (fsalt1, fsalt2) != (salt1, salt2):
                 if good == 0:
-                    return "invalid: first frame salt does not match header salt"
+                    return _Wal("invalid: first frame salt does not match header salt", nothing)
                 # left over from an earlier WAL generation; SQLite stops here and so do we
                 break
             checksum = _wal_checksum(frame[:8], big_endian, checksum)
@@ -645,18 +691,21 @@ def _check_wal(wal_path: str, db_path: str) -> str:
                 broken = (number, f"frame {number} has page number 0")
                 break
             good = number
+            pages.append(page_number)
             if truncate:
                 replayed = good
+        replays = frozenset(pages[:replayed])
         if broken is None:
             if replayed == good:
-                return f"ok ({replayed} frames)"
+                return _Wal(f"ok ({replayed} frames)", replays)
             # Every frame decoded; the generation just ends inside a transaction that was
             # never committed, which is the ordinary state of a copy of a live database.
             # SQLite drops exactly those frames, so nothing durable is lost -- not even
             # when there is no commit frame at all and the replayed prefix is empty.
-            return (
+            return _Wal(
                 f"ok ({replayed} frames; {good - replayed} further frames will be dropped, "
-                "as SQLite does: they were never committed)"
+                "as SQLite does: they were never committed)",
+                replays,
             )
         number, reason = broken
         # the frames after the break are dropped too, and they are usually the bulk of it
@@ -666,19 +715,21 @@ def _check_wal(wal_path: str, db_path: str) -> str:
         # a frame is unusable and nothing is replayed: everything the -wal holds is lost,
         # the copy is only the main file, and the break can hide a commit the main file
         # does not have -- which is what makes this worth failing on
-        return f"invalid: 0 of {present} frames will be replayed ({reason})"
+        return _Wal(f"invalid: 0 of {present} frames will be replayed ({reason})", replays)
     if commit is not None:
         # the dropped frames are not the uncommitted tail of a live copy: one of them
         # commits, so a transaction that was written in full does not survive the restore
-        return (
+        return _Wal(
             f"invalid: {replayed} of {present} frames will be replayed ({reason}; "
-            f"dropped frame {commit} is a commit frame, so a committed transaction is lost)"
+            f"dropped frame {commit} is a commit frame, so a committed transaction is lost)",
+            replays,
         )
     # A prefix up to the last commit frame is replayed and the rest is discarded, which
     # is exactly what SQLite does after a crash; no committed transaction is lost.
-    return (
+    return _Wal(
         f"ok ({replayed} frames; {present - replayed} further frames will be dropped, "
-        f"as SQLite does: {reason})"
+        f"as SQLite does: {reason})",
+        replays,
     )
 
 
@@ -786,14 +837,18 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             shm = [text for rel, text in problems.items() if _carries_no_data(rel)]
             wal_problems = [text for rel, text in problems.items() if not _carries_no_data(rel)]
             wal = None
+            wal_pages = None  # the pages a copied, readable -wal will actually restore
             wals = [rel for rel in copied if rel.endswith("-wal")]
             if wal_problems:
                 wal = "; ".join(sorted(wal_problems))
             elif wals:
                 # before SQLite opens the copy, so the -wal is read exactly as it was copied
                 try:
-                    wal = _check_wal(os.path.join(tmp, os.path.basename(wals[0])), copy)
+                    wal, wal_pages = _check_wal(
+                        os.path.join(tmp, os.path.basename(wals[0])), copy
+                    )
                 except OSError as exc:
+                    # what the -wal holds stays unknown, so it excuses nothing below
                     wal = NOT_CHECKED + str(exc)
             elif _shm_without_wal(entry["sidecars"]):
                 # the main file alone verifies fine, which is exactly the trap: it is missing
@@ -806,7 +861,7 @@ def verify(root: str, warnings: list[str] | None = None) -> list[dict]:
             # reaches, so a file (or a -wal) whose tail is missing passes it while the rows
             # that lived in the lost tail are gone. Whatever SQLite would say about such a
             # copy, it is not a copy anything should be restored from.
-            short = _check_truncation(copy, has_wal=bool(wals))
+            short = _check_truncation(copy, wal_pages=wal_pages)
             if short is None and wals and wal:
                 try:
                     page_size = _database_page_size(copy)

@@ -1151,6 +1151,60 @@ def test_text_output_never_crashes_on_file_names(tmp_path, encoding):
         assert expected.encode(encoding) in result.stdout
 
 
+def wal_frame_pages(wal, page_size=4096):
+    """(page numbers the frames carry, database size in pages the last commit frame gives).
+
+    The commit frame of a transaction records the size the database has once that
+    transaction is replayed, which is what page 1 of a checkpoint in flight would claim.
+    """
+    data, frame_size = wal.read_bytes(), 24 + page_size
+    pages, size_in_pages = [], 0
+    for number in range((len(data) - 32) // frame_size):
+        head = data[32 + number * frame_size :][:24]
+        pages.append(int.from_bytes(head[0:4], "big"))
+        size_in_pages = int.from_bytes(head[4:8], "big") or size_in_pages
+    return pages, size_in_pages
+
+
+def checkpoint_window_copy(src_dir, dst_dir, name="app.db", rows=400):
+    """A copy shaped like one taken while a checkpoint was writing the database back.
+
+    A checkpoint writes page 1 -- which carries the database's page count -- before the
+    pages that count covers, so a copy caught inside that window holds a main file shorter
+    than its own header claims next to a -wal that still holds every page the header
+    counts. The window is reproduced without racing a real checkpoint: the rows are
+    committed to the -wal only, so the main file keeps its checkpointed size, and page 1's
+    count is then set to the size the -wal's last commit frame gives the database, which is
+    what the checkpoint's page 1 would have said.
+
+    Returns (main path, -wal path, page count the header claims).
+    """
+    src_dir.mkdir(parents=True, exist_ok=True)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(src_dir / name)
+    try:
+        conn.execute("PRAGMA page_size=4096")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        conn.executemany("INSERT INTO events (body) VALUES (?)", [("late" * 60,)] * rows)
+        conn.commit()
+        shutil.copyfile(src_dir / name, dst_dir / name)
+        shutil.copyfile(src_dir / f"{name}-wal", dst_dir / f"{name}-wal")
+    finally:
+        conn.close()
+    main_path, wal = dst_dir / name, dst_dir / f"{name}-wal"
+    pages, page_count = wal_frame_pages(wal)
+    assert main_path.stat().st_size // 4096 < page_count  # the file is behind its own page 1
+    assert set(range(main_path.stat().st_size // 4096 + 1, page_count + 1)) <= set(pages)
+    with open(main_path, "r+b") as f:
+        f.seek(28)
+        f.write(page_count.to_bytes(4, "big"))
+    return main_path, wal, page_count
+
+
 def live_wal_copy(src_dir, dst_dir, name="app.db", page_size=None, rows=LIVE_ROWS_IN_WAL):
     """Copy a live WAL-mode database (main + -wal, uncheckpointed rows) into dst_dir.
 
@@ -1625,11 +1679,13 @@ def test_big_endian_wal_checksum(tmp_path):
     main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
     rewrite_wal_header(wal, magic=0x377F0683)
     rewrite_wal_frame_checksums(wal)  # the frame chain uses the magic's byte order too
-    assert audit._check_wal(str(wal), str(main_path)).startswith("ok (")
+    assert audit._check_wal(str(wal), str(main_path)).verdict.startswith("ok (")
     data = bytearray(wal.read_bytes())
     data[0:4] = (0x377F0682).to_bytes(4, "big")  # same checksum read as little-endian
     wal.write_bytes(bytes(data))
-    assert audit._check_wal(str(wal), str(main_path)) == "invalid: header checksum mismatch"
+    assert audit._check_wal(str(wal), str(main_path)).verdict == (
+        "invalid: header checksum mismatch"
+    )
 
 
 def test_wal_frame_count_stops_at_left_over_frames(tmp_path):
@@ -1639,7 +1695,7 @@ def test_wal_frame_count_stops_at_left_over_frames(tmp_path):
     stale = bytearray(data[32 : 32 + 24 + 4096])
     stale[8:16] = bytes(8)  # salts of an earlier WAL generation
     wal.write_bytes(data + bytes(stale) + b"partial frame")
-    assert audit._check_wal(str(wal), str(main_path)) == f"ok ({frames} frames)"
+    assert audit._check_wal(str(wal), str(main_path)).verdict == f"ok ({frames} frames)"
 
 
 @pytest.mark.parametrize(
@@ -1843,30 +1899,91 @@ def test_last_page_that_does_not_read_back_is_not_ok(tmp_path, monkeypatch, caps
     assert code == 1
 
 
-def test_page_count_is_not_claimed_against_a_unit_that_carries_a_wal(tmp_path, capsys):
+def test_page_count_claim_is_dropped_when_the_wal_holds_every_missing_page(tmp_path, capsys):
     """A checkpoint writes the new page count on page 1 before the pages it covers.
 
     A copy taken inside that window holds a main file shorter than its own header while the
-    -wal beside it still holds every missing page, so the page-count claim is dropped for a
-    unit that was copied with a -wal. Dropping it is not the same as passing the unit: what
-    SQLite makes of the two files together is still the verdict, and here it is not "ok".
+    -wal beside it still holds every missing page: SQLite replays them and the restore is
+    whole, so the page-count claim must not be turned into a verdict. The copy really is
+    whole -- the row count proves the pages came back -- which is why it passes.
     """
-    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
-    with open(main_path, "r+b") as f:
-        f.seek(28)
-        page_count = int.from_bytes(f.read(4), "big")
-        f.seek(28)
-        f.write((page_count + 1).to_bytes(4, "big"))  # a page 1 that is ahead of the file
+    main_path, wal, page_count = checkpoint_window_copy(tmp_path / "live", tmp_path / "tree")
     code, entry = verify_wal(capsys, tmp_path / "tree")
-    assert not entry["integrity"].startswith("truncated: ")
-    assert entry["integrity"] != "ok"
-    assert code == 1
-    # the very same main file, with no -wal to explain the gap, is reported as truncated
+    assert (entry["integrity"], entry["tables"]) == ("ok", {"events": 400})
+    assert code == 0
+    # the very same main file, with no -wal to hold the missing pages, is truncated
     wal.unlink()
+    size = main_path.stat().st_size
     code, entry = verify_wal(capsys, tmp_path / "tree")
     assert entry["integrity"] == (
-        f"truncated: file is {main_path.stat().st_size} bytes, short of the "
-        f"{(page_count + 1) * 4096} bytes its header claims ({page_count + 1} pages of 4096): "
-        "1 page(s) are missing from the end"
+        f"truncated: file is {size} bytes, short of the {page_count * 4096} bytes its header "
+        f"claims ({page_count} pages of 4096): {page_count - size // 4096} page(s) are "
+        "missing from the end"
     )
+    assert code == 1
+
+
+def test_page_count_claim_stands_when_the_wal_holds_only_some_missing_pages(tmp_path, capsys):
+    """Covering the gap in part is not covering it: three pages are still nowhere.
+
+    The checkpoint-window copy, with page 1 claiming three pages more than the -wal's last
+    commit frame gives the database. Every page but those three comes back, which is exactly
+    the case an overlap test would wave through.
+    """
+    main_path, wal, page_count = checkpoint_window_copy(tmp_path / "live", tmp_path / "tree")
+    with open(main_path, "r+b") as f:
+        f.seek(28)
+        f.write((page_count + 3).to_bytes(4, "big"))
+    size = main_path.stat().st_size
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["integrity"] == (
+        f"truncated: file is {size} bytes, short of the {(page_count + 3) * 4096} bytes its "
+        f"header claims ({page_count + 3} pages of 4096): {page_count + 3 - size // 4096} "
+        f"page(s) are missing from the end, and the -wal beside it restores only "
+        f"{page_count - size // 4096} of them"
+    )
+    assert code == 1
+
+
+def test_page_count_claim_stands_when_the_wal_does_not_hold_the_missing_pages(tmp_path, capsys):
+    """The carve-out is evidence, not a free pass: a -wal only excuses the pages it restores.
+
+    A main file cut by whole pages next to a -wal holding one frame for a page that is still
+    in the file. Nothing brings the lost pages back, and because the cut took only freelist
+    pages the b-tree walk never reaches them, so SQLite alone calls the pair healthy -- the
+    commonest shape of a live backup passing while more than half of it is gone.
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("PRAGMA page_size=4096")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY, body TEXT)")
+    conn.execute("CREATE TABLE scratch (id INTEGER PRIMARY KEY, body TEXT)")
+    conn.executemany("INSERT INTO keep (body) VALUES (?)", [("k" * 200,)] * 200)
+    conn.executemany("INSERT INTO scratch (body) VALUES (?)", [("s" * 200,)] * 600)
+    conn.commit()
+    conn.execute("DELETE FROM scratch")  # the tail pages go on the freelist, out of the walk
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+    conn.execute("UPDATE keep SET body='changed' WHERE id=1")  # one frame, for a page that stays
+    conn.commit()
+    shutil.copyfile(tmp_path / "app.db", tree / "app.db")
+    shutil.copyfile(tmp_path / "app.db-wal", tree / "app.db-wal")
+    conn.close()
+    main_path, wal = tree / "app.db", tree / "app.db-wal"
+    page_count = main_path.stat().st_size // 4096
+    truncate(main_path, 16 * 4096)
+    pages, _ = wal_frame_pages(wal)
+    assert max(pages) <= 16  # the -wal holds nothing past the end of the cut file
+    # SQLite reads the pair, replays the -wal and finds no fault: every row it walks is there
+    assert integrity_check(main_path) == [("ok",)]
+    code, entry = verify_wal(capsys, tree)
+    assert entry["integrity"] == (
+        f"truncated: file is {16 * 4096} bytes, short of the {page_count * 4096} bytes its "
+        f"header claims ({page_count} pages of 4096): {page_count - 16} page(s) are missing "
+        "from the end, and the -wal beside it restores none of them"
+    )
+    assert entry["wal"] == "ok (1 frames)"
     assert code == 1
