@@ -1692,3 +1692,76 @@ def test_module_entry_point_exit_codes(tree, tmp_path):
     assert missing.returncode == 2
     usage = subprocess.run(cmd, capture_output=True, env=env)
     assert usage.returncode == 2
+
+
+def truncate(path, size):
+    """Cut a file down to `size` bytes, the way an interrupted copy leaves one behind."""
+    with open(path, "r+b") as f:
+        f.truncate(size)
+    assert path.stat().st_size == size
+
+
+def integrity_check(path):
+    """What `PRAGMA integrity_check` alone says about a file, read-only and copy-free."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return conn.execute("PRAGMA integrity_check").fetchall()
+    finally:
+        conn.close()
+
+
+def test_database_truncated_to_1000_bytes_is_not_ok(tmp_path, capsys):
+    """A database cut down to 1000 bytes: the last page is a fragment, so the copy is not whole."""
+    make_db(tmp_path / "a.db", rows=300)
+    truncate(tmp_path / "a.db", 1000)
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert entry["integrity"] == (
+        "truncated: file is 1000 bytes, not a multiple of the 4096-byte page size: "
+        "the last page is 1000 of 4096 bytes"
+    )
+    assert code == 1
+
+
+def test_live_wal_database_truncated_to_1000_bytes_is_not_ok(tmp_path, capsys, live_wal_db):
+    """The same cut on a copy of a live WAL-mode database, -wal and all."""
+    tree = tmp_path / "copy"
+    shutil.copytree(live_wal_db.parent, tree)
+    truncate(tree / "app.db", 1000)
+    code, out, _ = run_cli(capsys, "verify", str(tree), "--json")
+    (entry,) = json.loads(out)
+    assert entry["class"] == "wal-family"
+    assert entry["integrity"].startswith("truncated: file is 1000 bytes, not a multiple of the ")
+    assert code == 1
+
+
+def test_database_one_byte_short_is_not_ok_although_sqlite_says_it_is(tmp_path, capsys):
+    """The case this check exists for: integrity_check reads no page past the b-tree it walks."""
+    make_db(tmp_path / "a.db", rows=300)
+    truncate(tmp_path / "a.db", (tmp_path / "a.db").stat().st_size - 1)
+    # SQLite alone calls this file healthy and hands back every row that was ever written
+    assert integrity_check(tmp_path / "a.db") == [("ok",)]
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert entry["integrity"] == (
+        "truncated: file is 77823 bytes, not a multiple of the 4096-byte page size: "
+        "the last page is 4095 of 4096 bytes"
+    )
+    # the row count is still reported -- it says how much of the backup reads back -- but it
+    # is counted over a file missing its tail, so it is not what the verdict rests on
+    assert entry["tables"] == {"items": 300}
+    assert code == 1
+
+
+def test_database_missing_a_whole_page_is_not_ok(tmp_path, capsys):
+    """A page-aligned cut leaves no fragment, so it is caught by the header's page count."""
+    make_db(tmp_path / "a.db", rows=300)
+    size = (tmp_path / "a.db").stat().st_size
+    truncate(tmp_path / "a.db", size - 4096)
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert entry["integrity"] == (
+        f"truncated: file is {size - 4096} bytes, short of the {size} bytes its header claims "
+        f"({size // 4096} pages of 4096): 1 page(s) are missing from the end"
+    )
+    assert code == 1
