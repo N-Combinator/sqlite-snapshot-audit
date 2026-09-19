@@ -1816,3 +1816,57 @@ def test_whole_database_with_a_legacy_header_is_not_called_truncated(tmp_path, c
     (entry,) = json.loads(out)
     assert (entry["integrity"], entry["tables"]) == ("ok", {"items": 300})
     assert code == 0
+
+
+def test_last_page_that_does_not_read_back_is_not_ok(tmp_path, monkeypatch, capsys):
+    """The third way from the issue: the right length on paper, no last page in the file.
+
+    A file still shrinking underneath the checker gets there, so the size is read through a
+    patched `os.path.getsize` that reports what the copy measured one page earlier. Only the
+    copy is affected: the source keeps its real size, as the scan measured it.
+    """
+    make_db(tmp_path / "a.db", rows=300)
+    real_getsize = os.path.getsize
+
+    def stale_getsize(path):
+        size = real_getsize(path)
+        is_copy = os.path.basename(path) == "a.db" and not str(path).startswith(str(tmp_path))
+        return size + 4096 if is_copy else size
+
+    monkeypatch.setattr(audit.os.path, "getsize", stale_getsize)
+    code, out, _ = run_cli(capsys, "verify", str(tmp_path), "--json")
+    (entry,) = json.loads(out)
+    assert entry["integrity"] == (
+        "truncated: last page stops after 0 of 4096 bytes "
+        "(the file shrank while it was being read)"
+    )
+    assert code == 1
+
+
+def test_page_count_is_not_claimed_against_a_unit_that_carries_a_wal(tmp_path, capsys):
+    """A checkpoint writes the new page count on page 1 before the pages it covers.
+
+    A copy taken inside that window holds a main file shorter than its own header while the
+    -wal beside it still holds every missing page, so the page-count claim is dropped for a
+    unit that was copied with a -wal. Dropping it is not the same as passing the unit: what
+    SQLite makes of the two files together is still the verdict, and here it is not "ok".
+    """
+    main_path, wal = live_wal_copy(tmp_path / "live", tmp_path / "tree")
+    with open(main_path, "r+b") as f:
+        f.seek(28)
+        page_count = int.from_bytes(f.read(4), "big")
+        f.seek(28)
+        f.write((page_count + 1).to_bytes(4, "big"))  # a page 1 that is ahead of the file
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert not entry["integrity"].startswith("truncated: ")
+    assert entry["integrity"] != "ok"
+    assert code == 1
+    # the very same main file, with no -wal to explain the gap, is reported as truncated
+    wal.unlink()
+    code, entry = verify_wal(capsys, tmp_path / "tree")
+    assert entry["integrity"] == (
+        f"truncated: file is {main_path.stat().st_size} bytes, short of the "
+        f"{(page_count + 1) * 4096} bytes its header claims ({page_count + 1} pages of 4096): "
+        "1 page(s) are missing from the end"
+    )
+    assert code == 1
